@@ -211,6 +211,53 @@ h3 { font-size: 0.85rem; font-weight: 650; margin: 0; }
   transform: translateX(12px);
 }
 
+/* INSTALLATION COMPLETE BANNER */
+.install-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: var(--pill-active-bg);
+  border: 1px solid var(--pill-active-fg);
+  border-radius: 14px;
+  padding: 12px 16px;
+}
+.install-banner[hidden] {
+  display: none;
+}
+.install-banner-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+.install-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--pill-active-fg);
+  color: #ffffff;
+  font-size: 0.82rem;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.install-banner strong {
+  display: block;
+  font-size: 0.83rem;
+  color: var(--pill-active-fg);
+}
+.install-banner p {
+  font-size: 0.74rem;
+  color: var(--text);
+  margin: 2px 0 0;
+}
+.install-dismiss-btn {
+  flex-shrink: 0;
+  padding: 7px 14px;
+}
+
 /* WORKSPACE BENTO GRID */
 .workspace-grid {
   display: grid;

@@ -8,7 +8,9 @@ mod sensors;
 use std::{
     fs::OpenOptions,
     io::Write,
-    path::PathBuf,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -28,8 +30,11 @@ use windows::{
     Data::Xml::Dom::XmlDocument,
     UI::Notifications::{ToastNotification, ToastNotificationManager},
     Win32::{
-        Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
-        System::{SystemInformation::GetLocalTime, Threading::CreateMutexW},
+        Foundation::{GetLastError, ERROR_ALREADY_EXISTS, WAIT_OBJECT_0},
+        System::{
+            SystemInformation::GetLocalTime,
+            Threading::{CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject, INFINITE},
+        },
     },
 };
 
@@ -47,9 +52,16 @@ const LOG_FILE: &str = "desk-pager.log";
 const SETTINGS_FILE: &str = "settings.cfg";
 const TEST_BUZZ_ARG: &str = "--test-buzz";
 const OPEN_PAIR_ARG: &str = "--open-pair";
+const AUTOSTART_ARG: &str = "--autostart";
+const INSTALL_ARG: &str = "--install";
+const NO_INSTALL_ARG: &str = "--no-install";
+const JUST_INSTALLED_ARG: &str = "--just-installed";
+const UNINSTALL_ARG: &str = "--uninstall";
 const BREAK_AFTER_SECS_ARG: &str = "--break-after-secs";
 const MIN_BREAK_AFTER_SECS: u64 = 10;
 const MAX_BREAK_AFTER_SECS: u64 = 5400;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskPager";
 
 const MENU_PAIR: &str = "pair";
 const MENU_TEST: &str = "test";
@@ -171,6 +183,8 @@ impl ScheduleSettings {
 struct AppState {
     topic: Mutex<String>,
     first_run: bool,
+    just_installed: AtomicBool,
+    quitting: AtomicBool,
     paused: AtomicBool,
     meeting_until: AtomicU64,
     sending: Arc<AtomicBool>,
@@ -206,6 +220,8 @@ struct StatusInfo {
     in_meeting: bool,
     autostart: bool,
     desktop_notify: bool,
+    just_installed: bool,
+    install_path: String,
     idle_secs: u64,
     sitting_secs: u64,
     sitting_minutes: u64,
@@ -257,6 +273,12 @@ fn regenerate_pairing(state: State<'_, AppState>) -> Result<PairingInfo, String>
     build_pairing_info(&new_topic, false)
 }
 
+/// Dismisses the one-time "Installation Complete" banner in the dashboard UI.
+#[tauri::command]
+fn dismiss_install_banner(state: State<'_, AppState>) {
+    state.just_installed.store(false, Ordering::Relaxed);
+}
+
 /// Returns live timer state for the desktop dashboard window.
 #[tauri::command]
 fn app_status(state: State<'_, AppState>) -> StatusInfo {
@@ -267,11 +289,17 @@ fn app_status(state: State<'_, AppState>) -> StatusInfo {
     let desktop_notify = state.settings.lock().map(|g| g.desktop_notify).unwrap_or(true);
     let call_app = state.call_app.lock().ok().and_then(|g| g.clone());
     let in_meeting = state.meeting_until.load(Ordering::Relaxed) > now;
+    let install_path = canonical_install_exe()
+        .or_else(|| std::env::current_exe().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     StatusInfo {
         paused: state.paused.load(Ordering::Relaxed),
         in_meeting,
         autostart: autostart_enabled(),
         desktop_notify,
+        just_installed: state.just_installed.load(Ordering::Relaxed),
+        install_path,
         idle_secs: state.idle_secs.load(Ordering::Relaxed),
         sitting_secs,
         sitting_minutes: sitting_secs / 60,
@@ -484,6 +512,17 @@ fn parse_break_after_secs(args: &[String]) -> Result<Option<u64>, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == UNINSTALL_ARG) {
+        uninstall_desk_pager();
+        return;
+    }
+    if should_self_install(&args) {
+        if let Err(e) = self_install_and_relaunch(&args) {
+            log(&format!("self-install failed (running in place): {e}"));
+        } else {
+            return;
+        }
+    }
     let break_override = match parse_break_after_secs(&args) {
         Ok(v) => v,
         Err(e) => {
@@ -506,12 +545,16 @@ fn main() {
     sensors::spawn();
 
     let first_run = topic.is_new;
+    let just_installed = args.iter().any(|a| a == JUST_INSTALLED_ARG);
+    let is_autostart = args.iter().any(|a| a == AUTOSTART_ARG);
     let settings = load_settings();
     let cfg = settings.to_config(break_override);
     let app = tauri::Builder::default()
         .manage(AppState {
             topic: Mutex::new(topic.value),
             first_run,
+            just_installed: AtomicBool::new(just_installed),
+            quitting: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             meeting_until: AtomicU64::new(0),
             sending: Arc::new(AtomicBool::new(false)),
@@ -534,6 +577,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             pairing_info,
             regenerate_pairing,
+            dismiss_install_banner,
             pairing_rendered,
             app_status,
             get_settings,
@@ -634,14 +678,25 @@ fn main() {
                         let enable = !autostart_enabled();
                         let _ = set_autostart_cmd(app.state::<AppState>(), enable);
                     }
-                    MENU_QUIT => app.exit(0),
+                    MENU_QUIT => {
+                        app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;
 
             let handle = app.handle().clone();
             std::thread::spawn(move || run_timer(&handle, &status, &tray));
-            if first_run || args.iter().any(|arg| arg == OPEN_PAIR_ARG) {
+            spawn_show_window_listener(app.handle().clone());
+
+            if just_installed {
+                let _ = show_silent_desktop_notification(
+                    "Desk Pager installed",
+                    "Added to Start Menu & System Tray. You can safely delete the downloaded installer file.",
+                );
+            }
+            if !is_autostart || first_run || just_installed || args.iter().any(|arg| arg == OPEN_PAIR_ARG) {
                 open_pairing(app.handle());
             }
             if args.iter().any(|arg| arg == TEST_BUZZ_ARG) {
@@ -653,18 +708,28 @@ fn main() {
                 spawn_deliver(app.handle(), "Desk Pager test", "Test buzz from your laptop.".into());
             }
             log(&format!(
-                "started, first run: {first_run}, break_after: {}s, long_break_after: {}s, desktop_notify: {}",
+                "started, first run: {first_run}, just_installed: {just_installed}, break_after: {}s, long_break_after: {}s, desktop_notify: {}",
                 cfg.break_after, cfg.long_break_after, settings.desktop_notify
             ));
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if !window.app_handle().state::<AppState>().quitting.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    report(window.hide(), "window hide to tray");
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("failed to build tauri app");
 
-    app.run(|_, event| {
-        // code None = "last window closed": stay in the tray. Some = Quit, which must still exit.
-        if let RunEvent::ExitRequested { code: None, api, .. } = event {
-            api.prevent_exit();
+    app.run(|app_handle, event| {
+        // Stay alive in the system tray when windows close; only exit when MENU_QUIT sets `quitting = true`.
+        if let RunEvent::ExitRequested { api, .. } = event {
+            if !app_handle.state::<AppState>().quitting.load(Ordering::SeqCst) {
+                api.prevent_exit();
+            }
         }
     });
 }
@@ -892,9 +957,11 @@ async fn send(topic: &str, title: &str, body: String) -> Result<(), String> {
         .map_err(strip)
 }
 
-/// Opens (or focuses) the pairing window; it is destroyed when closed.
+/// Opens (or unminimizes, shows, and focuses) the dashboard window.
 fn open_pairing(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(PAIR_WINDOW) {
+        report(window.unminimize(), "pairing unminimize");
+        report(window.show(), "pairing show");
         report(window.set_focus(), "pairing focus");
         return;
     }
@@ -913,29 +980,206 @@ fn open_pairing(app: &AppHandle) {
     });
 }
 
+/// Returns the canonical per-user installation path (`%LOCALAPPDATA%\Programs\DeskPager\desk-pager.exe`).
+fn canonical_install_exe() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("Programs").join("DeskPager").join("desk-pager.exe"))
+}
+
+/// Returns true when the current executable should install itself into `%LOCALAPPDATA%\Programs\DeskPager`.
+fn should_self_install(args: &[String]) -> bool {
+    if args.iter().any(|a| a == NO_INSTALL_ARG || a == JUST_INSTALLED_ARG || a == UNINSTALL_ARG) {
+        return false;
+    }
+    let Some(target) = canonical_install_exe() else {
+        return false;
+    };
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    let cur_norm = current.to_string_lossy().to_ascii_lowercase();
+    let tgt_norm = target.to_string_lossy().to_ascii_lowercase();
+    if cur_norm == tgt_norm {
+        return false;
+    }
+    if args.iter().any(|a| a == INSTALL_ARG) {
+        return true;
+    }
+    // Skip automatic self-install when running directly from a Cargo build tree (`target\debug` or `target\release`).
+    !(cur_norm.contains("\\target\\debug\\") || cur_norm.contains("\\target\\release\\"))
+}
+
+/// Copies the current binary to `%LOCALAPPDATA%\Programs\DeskPager\desk-pager.exe`, creates Start Menu & Desktop shortcuts,
+/// registers Windows Installed Apps, enables Start with Windows, and launches the installed copy with `--just-installed`.
+fn self_install_and_relaunch(args: &[String]) -> Result<(), String> {
+    let target = canonical_install_exe().ok_or("LOCALAPPDATA not set")?;
+    let install_dir = target.parent().ok_or("invalid install directory")?;
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+
+    // Stop any running older instance so the target binary can be overwritten cleanly.
+    let my_pid = std::process::id();
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "desk-pager.exe", "/FI", &format!("PID ne {my_pid}")])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    std::thread::sleep(Duration::from_millis(350));
+
+    std::fs::create_dir_all(install_dir).map_err(|e| format!("create install dir failed: {e}"))?;
+    std::fs::copy(&current, &target).map_err(|e| format!("copy binary failed: {e}"))?;
+
+    register_uninstaller(&target, install_dir);
+    create_shortcuts(&target);
+    let _ = set_autostart(true);
+
+    let mut launch_args: Vec<String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| *a != INSTALL_ARG && *a != JUST_INSTALLED_ARG && *a != OPEN_PAIR_ARG)
+        .cloned()
+        .collect();
+    launch_args.push(OPEN_PAIR_ARG.to_string());
+    launch_args.push(JUST_INSTALLED_ARG.to_string());
+
+    Command::new(&target)
+        .args(&launch_args)
+        .spawn()
+        .map_err(|e| format!("relaunch installed binary failed: {e}"))?;
+    log(&format!("installed Desk Pager to {}", target.display()));
+    Ok(())
+}
+
+/// Registers Desk Pager under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskPager`.
+fn register_uninstaller(target_exe: &Path, install_dir: &Path) {
+    if let Ok(key) = windows_registry::CURRENT_USER.create(UNINSTALL_KEY) {
+        let exe_str = target_exe.display().to_string();
+        let _ = key.set_string("DisplayName", "Desk Pager");
+        let _ = key.set_string("DisplayVersion", env!("CARGO_PKG_VERSION"));
+        let _ = key.set_string("Publisher", "Desk Pager");
+        let _ = key.set_string("DisplayIcon", &exe_str);
+        let _ = key.set_string("InstallLocation", install_dir.display().to_string());
+        let _ = key.set_string("UninstallString", format!("\"{exe_str}\" {UNINSTALL_ARG}"));
+        let _ = key.set_u32("NoModify", 1);
+        let _ = key.set_u32("NoRepair", 1);
+    }
+}
+
+/// Creates Start Menu and Desktop `.lnk` shortcuts pointing to the installed `desk-pager.exe`.
+fn create_shortcuts(target_exe: &Path) {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let start_menu_lnk = PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Desk Pager.lnk");
+        create_windows_shortcut(target_exe, &start_menu_lnk);
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let desktop_lnk = PathBuf::from(profile).join("Desktop").join("Desk Pager.lnk");
+        create_windows_shortcut(target_exe, &desktop_lnk);
+    }
+}
+
+/// Uses `WScript.Shell` via PowerShell to write a standard Windows `.lnk` shortcut without extra crates.
+fn create_windows_shortcut(target_exe: &Path, shortcut_path: &Path) {
+    let tgt = target_exe.display().to_string().replace('\'', "''");
+    let lnk = shortcut_path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('{lnk}'); $s.TargetPath = '{tgt}'; $s.Arguments = '{OPEN_PAIR_ARG}'; $s.Description = 'Desk Pager — Posture, Eye Rest & Hydration Reminders'; $s.IconLocation = '{tgt},0'; $s.Save()"
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+/// Uninstalls Desk Pager when invoked from Windows Settings -> Installed Apps (`--uninstall`).
+fn uninstall_desk_pager() {
+    let my_pid = std::process::id();
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "desk-pager.exe", "/FI", &format!("PID ne {my_pid}")])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    let _ = set_autostart(false);
+    let _ = windows_registry::CURRENT_USER.remove_tree(UNINSTALL_KEY);
+    let _ = windows_registry::CURRENT_USER.remove_tree(AUMID_KEY);
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let _ = std::fs::remove_file(
+            PathBuf::from(appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Desk Pager.lnk"),
+        );
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let _ = std::fs::remove_file(PathBuf::from(profile).join("Desktop").join("Desk Pager.lnk"));
+    }
+    if let Some(exe) = canonical_install_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir_str = dir.display().to_string();
+            let _ = Command::new("cmd")
+                .args(["/C", &format!("ping 127.0.0.1 -n 2 > nul & rmdir /S /Q \"{dir_str}\"")])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+    }
+}
+
 /// Whether the per-user Run key starts this app at sign-in.
 fn autostart_enabled() -> bool {
     windows_registry::CURRENT_USER.open(RUN_KEY).and_then(|key| key.get_string(RUN_VALUE)).is_ok()
 }
 
-/// Adds or removes this exe from the per-user Run key.
+/// Adds or removes the installed exe from the per-user Run key (`--autostart` starts silently in the tray).
 fn set_autostart(enable: bool) -> Result<(), String> {
     let key = windows_registry::CURRENT_USER.create(RUN_KEY).map_err(|e| e.to_string())?;
     if enable {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        key.set_string(RUN_VALUE, format!("\"{}\"", exe.display())).map_err(|e| e.to_string())
+        let exe = canonical_install_exe()
+            .filter(|p| p.exists())
+            .or_else(|| std::env::current_exe().ok())
+            .ok_or("cannot resolve executable path")?;
+        key.set_string(RUN_VALUE, format!("\"{}\" {AUTOSTART_ARG}", exe.display()))
+            .map_err(|e| e.to_string())
     } else {
-        key.remove_value(RUN_VALUE).map_err(|e| e.to_string())
+        let _ = key.remove_value(RUN_VALUE);
+        Ok(())
     }
 }
 
-/// False when another Desk Pager is already running (two would double every buzz).
+/// False when another Desk Pager is already running; signals the running instance to show its window.
 fn claim_single_instance() -> bool {
     // SAFETY: the mutex handle is deliberately leaked so it lives as long as the process.
     unsafe {
         let created = CreateMutexW(None, true, w!("Local\\DeskPagerSingleInstance"));
-        created.is_ok() && GetLastError() != ERROR_ALREADY_EXISTS
+        if created.is_ok() && GetLastError() != ERROR_ALREADY_EXISTS {
+            return true;
+        }
+        if let Ok(evt) = CreateEventW(None, false, false, w!("Local\\DeskPagerShowWindowEvent")) {
+            let _ = SetEvent(evt);
+        }
+        false
     }
+}
+
+/// Listens for `Local\DeskPagerShowWindowEvent` so launching Desk Pager while it is in the tray opens the window.
+fn spawn_show_window_listener(app: AppHandle) {
+    std::thread::spawn(move || {
+        // SAFETY: standard Win32 auto-reset named event waited on a dedicated background thread.
+        unsafe {
+            let Ok(evt) = CreateEventW(None, false, false, w!("Local\\DeskPagerShowWindowEvent")) else {
+                return;
+            };
+            loop {
+                if WaitForSingleObject(evt, INFINITE) == WAIT_OBJECT_0 {
+                    open_pairing(&app);
+                } else {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn unix_secs() -> u64 {
