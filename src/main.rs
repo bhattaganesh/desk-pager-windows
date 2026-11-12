@@ -698,8 +698,8 @@ fn main() {
 
             if just_installed {
                 let _ = show_silent_desktop_notification(
-                    "Desk Pager installed",
-                    "Added to Start Menu & System Tray. You can safely delete the downloaded installer file.",
+                    "Desk Pager is ready",
+                    "Installed to your Start Menu and running quietly in the system tray.",
                 );
             }
             if !is_autostart || first_run || just_installed || args.iter().any(|arg| arg == OPEN_PAIR_ARG) {
