@@ -138,7 +138,10 @@ async function refreshStatus() {
         : "Tier 1 · Quick Stretch";
     shortSub.textContent = `${s.short_break_secs}s pause · spine, eyes & water`;
 
-    if (s.break_after_secs < 120) {
+    if (s.sitting_secs >= s.break_after_secs && s.idle_secs >= 5) {
+      shortMeta.textContent = `${Math.min(s.idle_secs, s.short_break_secs)}/${s.short_break_secs}s`;
+      shortRem.textContent = "Stretching…";
+    } else if (s.break_after_secs < 120) {
       shortMeta.textContent = `${s.sitting_secs}/${s.break_after_secs}s`;
       const remS = Math.max(0, s.break_after_secs - s.sitting_secs);
       shortRem.textContent = remS === 0 ? "Stretch due!" : `${remS}s left`;
@@ -154,7 +157,11 @@ async function refreshStatus() {
     longSub.textContent = `${s.long_break_mins} min walk & back recovery`;
     longMeta.textContent = `${s.long_sitting_minutes} / ${longTargetMin}m`;
     const longRemM = Math.max(0, longTargetMin - s.long_sitting_minutes);
-    longRem.textContent = longRemM === 0 ? "Long break due!" : `${longRemM}m left`;
+    if (s.long_sitting_secs >= s.long_break_after_secs && s.idle_secs >= 10) {
+      longRem.textContent = `Break ${Math.floor(s.idle_secs / 60)}/${s.long_break_mins}m`;
+    } else {
+      longRem.textContent = longRemM === 0 ? "Long break due!" : `${longRemM}m left`;
+    }
 
     meetingBtn.textContent = s.in_meeting ? "In a Meeting: On" : "In a Meeting: Off";
     meetingBtn.classList.toggle("btn-meeting-on", Boolean(s.in_meeting));

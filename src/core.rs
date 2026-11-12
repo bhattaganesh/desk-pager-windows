@@ -70,6 +70,28 @@ pub fn active_call_app(apps: &[String]) -> Option<&str> {
     apps.iter().map(String::as_str).find(|app| is_call_app(app))
 }
 
+/// Returns one of 4 rotating, evidence-based 30-second ergonomic micro-prompts for Quick Stretch alerts.
+///
+/// * `cycle_index` - Zero-based or one-based stretch counter used to rotate the prompt.
+/// * `sitting_mins` - Whole minutes sat in the current stretch cycle.
+/// * `stretch_secs` - Configured stretch pause duration in seconds.
+pub fn stretch_prompt(cycle_index: u32, sitting_mins: u64, stretch_secs: u64) -> String {
+    match cycle_index % 4 {
+        0 => format!(
+            "Sitting {sitting_mins} min — stand up for {stretch_secs}s, reach overhead to decompress your lower spine, and sip water."
+        ),
+        1 => format!(
+            "Sitting {sitting_mins} min — look 20 ft away for {stretch_secs}s (20-20-20 eye rest), blink slowly, and roll your shoulders back."
+        ),
+        2 => format!(
+            "Sitting {sitting_mins} min — stand for {stretch_secs}s, place your hands on your lower back, gently arch backward, and drink water."
+        ),
+        _ => format!(
+            "Sitting {sitting_mins} min — stand up for {stretch_secs}s, tuck your chin, tilt each ear toward your shoulder, and take 3 deep breaths."
+        ),
+    }
+}
+
 /// Which tier of break reminder triggered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlertKind {
@@ -485,5 +507,18 @@ mod tests {
         assert_eq!(active_call_app(&with_call), Some("ms-teams.exe"));
         assert!(is_call_app("Zoom.exe"));
         assert!(is_call_app("chrome.exe"));
+    }
+
+    #[test]
+    fn rotates_four_distinct_stretch_prompts() {
+        let p0 = stretch_prompt(0, 30, 30);
+        let p1 = stretch_prompt(1, 30, 30);
+        let p2 = stretch_prompt(2, 30, 30);
+        let p3 = stretch_prompt(3, 30, 30);
+        let p4 = stretch_prompt(4, 30, 30);
+        assert_ne!(p0, p1);
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert_eq!(p0, p4);
     }
 }

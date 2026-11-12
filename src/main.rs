@@ -175,6 +175,7 @@ struct AppState {
     meeting_until: AtomicU64,
     sending: Arc<AtomicBool>,
     phone_alarm_active: AtomicBool,
+    idle_secs: AtomicU64,
     sitting_secs: AtomicU64,
     long_sitting_secs: AtomicU64,
     stretches_completed: AtomicU64,
@@ -205,6 +206,7 @@ struct StatusInfo {
     in_meeting: bool,
     autostart: bool,
     desktop_notify: bool,
+    idle_secs: u64,
     sitting_secs: u64,
     sitting_minutes: u64,
     break_after_secs: u64,
@@ -258,6 +260,7 @@ fn app_status(state: State<'_, AppState>) -> StatusInfo {
         in_meeting,
         autostart: autostart_enabled(),
         desktop_notify,
+        idle_secs: state.idle_secs.load(Ordering::Relaxed),
         sitting_secs,
         sitting_minutes: sitting_secs / 60,
         break_after_secs: cfg.break_after,
@@ -501,6 +504,7 @@ fn main() {
             meeting_until: AtomicU64::new(0),
             sending: Arc::new(AtomicBool::new(false)),
             phone_alarm_active: AtomicBool::new(false),
+            idle_secs: AtomicU64::new(0),
             sitting_secs: AtomicU64::new(0),
             long_sitting_secs: AtomicU64::new(0),
             stretches_completed: AtomicU64::new(0),
@@ -696,6 +700,7 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
             }
             match sensors::idle_secs() {
                 Ok(idle) => {
+                    state.idle_secs.store(idle, Ordering::Relaxed);
                     if idle >= cfg.short_break_secs.min(30)
                         && state.phone_alarm_active.swap(false, Ordering::Relaxed)
                     {
@@ -711,17 +716,19 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                     if let Some(alert) = tracker.tick(&cfg, now, idle, locked, hold_label.is_some()) {
                         match alert.kind {
                             core::AlertKind::QuickStretch => {
-                                let body = format!(
-                                    "Sitting {} min — stand up for {}s, stretch your back, rest your eyes, and drink water.",
-                                    alert.minutes, cfg.short_break_secs
+                                let body = core::stretch_prompt(
+                                    tracker.stretches_completed(),
+                                    alert.minutes,
+                                    cfg.short_break_secs,
                                 );
                                 maybe_notify_desktop(app, "Quick stretch & eye rest", &body);
                                 spawn_deliver(app, "Quick stretch & eye rest", body);
                             }
                             core::AlertKind::LongBreak => {
                                 let body = format!(
-                                    "At your desk for {} min — step away for {} min to walk and rest your lower back.",
+                                    "At your desk for {} min ({} stretches done) — step away for {} min to walk, hydrate, and unload your lower back.",
                                     alert.minutes,
+                                    tracker.stretches_completed(),
                                     cfg.idle_away / 60
                                 );
                                 state.phone_alarm_active.store(true, Ordering::Relaxed);
