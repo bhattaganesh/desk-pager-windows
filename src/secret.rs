@@ -27,12 +27,18 @@ pub fn load_or_create() -> Result<Topic> {
     if let Some(value) = read()? {
         return Ok(Topic { value, is_new: false });
     }
+    let value = regenerate()?;
+    Ok(Topic { value, is_new: true })
+}
+
+/// Generates and stores a fresh 128-bit random topic in Windows Credential Manager, replacing any old one.
+pub fn regenerate() -> Result<String> {
     let mut random = [0u8; TOPIC_RANDOM_BYTES];
     getrandom::fill(&mut random).map_err(|e| windows::core::Error::from(std::io::Error::other(e.to_string())))?;
     let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
     let value = format!("{TOPIC_PREFIX}{hex}");
     write(&value)?;
-    Ok(Topic { value, is_new: true })
+    Ok(value)
 }
 
 fn read() -> Result<Option<String>> {

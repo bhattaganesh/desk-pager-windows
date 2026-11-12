@@ -24,7 +24,9 @@ use tauri::{
     AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder,
 };
 use windows::{
-    core::w,
+    core::{h, w, HSTRING},
+    Data::Xml::Dom::XmlDocument,
+    UI::Notifications::{ToastNotification, ToastNotificationManager},
     Win32::{
         Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
         System::{SystemInformation::GetLocalTime, Threading::CreateMutexW},
@@ -51,21 +53,28 @@ const MAX_BREAK_AFTER_SECS: u64 = 5400;
 
 const MENU_PAIR: &str = "pair";
 const MENU_TEST: &str = "test";
+const MENU_MEETING: &str = "meeting";
+const MENU_DESKTOP_NOTIFY: &str = "desktop_notify";
 const MENU_PAUSE: &str = "pause";
 const MENU_AUTOSTART: &str = "autostart";
 const MENU_QUIT: &str = "quit";
+const MEETING_HOLD_SECS: u64 = 90 * 60;
+const AUMID_KEY: &str = r"Software\Classes\AppUserModelId\DeskPager";
+const CLEAR_TITLE: &str = "deskpager-clear";
 
 /// User-customizable two-tier break schedule (Quick Stretch + Long Break).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 struct ScheduleSettings {
-    /// Quick stretch interval in minutes (e.g. 20, 30, 40, 45, 60).
+    /// Quick stretch interval in minutes (`1..=180`, e.g. 20, 25, 30, 45, 60).
     short_every_mins: u64,
-    /// Quick stretch pause duration in seconds (e.g. 20, 30, 45, 60).
+    /// Quick stretch pause duration in seconds (`5..=300`, e.g. 15, 20, 30, 45, 60).
     short_break_secs: u64,
-    /// Cumulative sitting before a long break in minutes (e.g. 60, 90, 120, 180).
+    /// Cumulative sitting before a long break in minutes (`5..=360`, e.g. 60, 90, 120, 180).
     long_every_mins: u64,
-    /// Long break duration in minutes required to reset the long session (e.g. 5, 10, 15).
+    /// Long break duration in minutes required to reset the long session (`1..=60`, e.g. 5, 10, 15).
     long_break_mins: u64,
+    /// Whether to show a silent Windows 11 notification alongside phone alerts (default `true`).
+    desktop_notify: bool,
 }
 
 impl Default for ScheduleSettings {
@@ -75,22 +84,24 @@ impl Default for ScheduleSettings {
             short_break_secs: 30,
             long_every_mins: 120,
             long_break_mins: 10,
+            desktop_notify: true,
         }
     }
 }
 
 impl ScheduleSettings {
-    /// Clamps user-provided schedule values to safe ergonomic bounds.
+    /// Clamps user-provided schedule values to safe ergonomic bounds while allowing custom numbers.
     fn sanitized(self) -> Self {
-        let short_every_mins = self.short_every_mins.clamp(15, 90);
-        let short_break_secs = self.short_break_secs.clamp(10, 180);
-        let long_every_mins = self.long_every_mins.clamp(short_every_mins.max(45), 240);
-        let long_break_mins = self.long_break_mins.clamp(3, 30);
+        let short_every_mins = self.short_every_mins.clamp(1, 180);
+        let short_break_secs = self.short_break_secs.clamp(5, 300);
+        let long_every_mins = self.long_every_mins.clamp(short_every_mins.max(5), 360);
+        let long_break_mins = self.long_break_mins.clamp(1, 60);
         Self {
             short_every_mins,
             short_break_secs,
             long_every_mins,
             long_break_mins,
+            desktop_notify: self.desktop_notify,
         }
     }
 
@@ -110,8 +121,12 @@ impl ScheduleSettings {
     fn to_cfg_text(self) -> String {
         let s = self.sanitized();
         format!(
-            "short_every_mins={}\nshort_break_secs={}\nlong_every_mins={}\nlong_break_mins={}\n",
-            s.short_every_mins, s.short_break_secs, s.long_every_mins, s.long_break_mins
+            "short_every_mins={}\nshort_break_secs={}\nlong_every_mins={}\nlong_break_mins={}\ndesktop_notify={}\n",
+            s.short_every_mins,
+            s.short_break_secs,
+            s.long_every_mins,
+            s.long_break_mins,
+            if s.desktop_notify { 1 } else { 0 }
         )
     }
 
@@ -120,12 +135,31 @@ impl ScheduleSettings {
         let mut s = Self::default();
         for line in raw.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
-            let Ok(val) = v.trim().parse::<u64>() else { continue };
+            let v_trimmed = v.trim();
             match k.trim() {
-                "short_every_mins" => s.short_every_mins = val,
-                "short_break_secs" => s.short_break_secs = val,
-                "long_every_mins" => s.long_every_mins = val,
-                "long_break_mins" => s.long_break_mins = val,
+                "short_every_mins" => {
+                    if let Ok(val) = v_trimmed.parse::<u64>() {
+                        s.short_every_mins = val;
+                    }
+                }
+                "short_break_secs" => {
+                    if let Ok(val) = v_trimmed.parse::<u64>() {
+                        s.short_break_secs = val;
+                    }
+                }
+                "long_every_mins" => {
+                    if let Ok(val) = v_trimmed.parse::<u64>() {
+                        s.long_every_mins = val;
+                    }
+                }
+                "long_break_mins" => {
+                    if let Ok(val) = v_trimmed.parse::<u64>() {
+                        s.long_break_mins = val;
+                    }
+                }
+                "desktop_notify" => {
+                    s.desktop_notify = !matches!(v_trimmed, "0" | "false" | "off");
+                }
                 _ => {}
             }
         }
@@ -135,18 +169,25 @@ impl ScheduleSettings {
 
 /// Shared between the tray menu, the pairing window and the timer thread.
 struct AppState {
-    topic: String,
+    topic: Mutex<String>,
     first_run: bool,
     paused: AtomicBool,
+    meeting_until: AtomicU64,
     sending: Arc<AtomicBool>,
+    phone_alarm_active: AtomicBool,
     sitting_secs: AtomicU64,
     long_sitting_secs: AtomicU64,
+    stretches_completed: AtomicU64,
     reset_short_req: AtomicBool,
+    reset_all_req: AtomicBool,
     break_override: Option<u64>,
     settings: Mutex<ScheduleSettings>,
     cfg: Mutex<core::Config>,
     call_app: Mutex<Option<String>>,
     pause_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    meeting_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
+    desktop_notify_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
+    autostart_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
 
 /// What the pairing window shows.
@@ -161,6 +202,9 @@ struct PairingInfo {
 #[derive(Serialize)]
 struct StatusInfo {
     paused: bool,
+    in_meeting: bool,
+    autostart: bool,
+    desktop_notify: bool,
     sitting_secs: u64,
     sitting_minutes: u64,
     break_after_secs: u64,
@@ -169,27 +213,51 @@ struct StatusInfo {
     long_sitting_minutes: u64,
     long_break_after_secs: u64,
     long_break_mins: u64,
+    stretches_completed: u64,
     call_app: Option<String>,
+}
+
+/// Builds a `PairingInfo` payload with SVG QR code from a topic string.
+fn build_pairing_info(topic: &str, first_run: bool) -> Result<PairingInfo, String> {
+    let link = format!("{PAIR_LINK_PREFIX}{topic}");
+    let qr = QrCode::new(link.as_bytes()).map_err(|e| format!("QR code failed: {e}"))?;
+    let qr_svg = qr.render::<svg::Color>().min_dimensions(QR_SIZE_PX, QR_SIZE_PX).build();
+    Ok(PairingInfo { code: topic.to_string(), qr_svg, first_run })
 }
 
 /// Returns the pairing code and a QR code of the `deskpager://` pairing link.
 #[tauri::command]
 fn pairing_info(state: State<'_, AppState>) -> Result<PairingInfo, String> {
-    let link = format!("{PAIR_LINK_PREFIX}{}", state.topic);
-    let qr = QrCode::new(link.as_bytes()).map_err(|e| format!("QR code failed: {e}"))?;
-    let qr_svg = qr.render::<svg::Color>().min_dimensions(QR_SIZE_PX, QR_SIZE_PX).build();
-    Ok(PairingInfo { code: state.topic.clone(), qr_svg, first_run: state.first_run })
+    let topic = state.topic.lock().map_err(|_| "topic lock poisoned")?.clone();
+    build_pairing_info(&topic, state.first_run)
+}
+
+/// Rotates the 128-bit secret topic in Windows Credential Manager and returns the new QR and code.
+#[tauri::command]
+fn regenerate_pairing(state: State<'_, AppState>) -> Result<PairingInfo, String> {
+    let new_topic = secret::regenerate().map_err(|e| format!("cannot regenerate topic: {e}"))?;
+    if let Ok(mut g) = state.topic.lock() {
+        *g = new_topic.clone();
+    }
+    log("pairing topic regenerated by user");
+    build_pairing_info(&new_topic, false)
 }
 
 /// Returns live timer state for the desktop dashboard window.
 #[tauri::command]
 fn app_status(state: State<'_, AppState>) -> StatusInfo {
+    let now = unix_secs();
     let sitting_secs = state.sitting_secs.load(Ordering::Relaxed);
     let long_sitting_secs = state.long_sitting_secs.load(Ordering::Relaxed);
     let cfg = state.cfg.lock().map(|g| *g).unwrap_or_default();
+    let desktop_notify = state.settings.lock().map(|g| g.desktop_notify).unwrap_or(true);
     let call_app = state.call_app.lock().ok().and_then(|g| g.clone());
+    let in_meeting = state.meeting_until.load(Ordering::Relaxed) > now;
     StatusInfo {
         paused: state.paused.load(Ordering::Relaxed),
+        in_meeting,
+        autostart: autostart_enabled(),
+        desktop_notify,
         sitting_secs,
         sitting_minutes: sitting_secs / 60,
         break_after_secs: cfg.break_after,
@@ -198,6 +266,7 @@ fn app_status(state: State<'_, AppState>) -> StatusInfo {
         long_sitting_minutes: long_sitting_secs / 60,
         long_break_after_secs: cfg.long_break_after,
         long_break_mins: cfg.idle_away / 60,
+        stretches_completed: state.stretches_completed.load(Ordering::Relaxed),
         call_app,
     }
 }
@@ -216,12 +285,15 @@ fn save_settings(
     short_break_secs: u64,
     long_every_mins: u64,
     long_break_mins: u64,
+    desktop_notify: Option<bool>,
 ) -> Result<ScheduleSettings, String> {
+    let prev_notify = state.settings.lock().map(|g| g.desktop_notify).unwrap_or(true);
     let updated = ScheduleSettings {
         short_every_mins,
         short_break_secs,
         long_every_mins,
         long_break_mins,
+        desktop_notify: desktop_notify.unwrap_or(prev_notify),
     }
     .sanitized();
     persist_settings(updated)?;
@@ -231,27 +303,110 @@ fn save_settings(
     if let Ok(mut g) = state.cfg.lock() {
         *g = updated.to_config(state.break_override);
     }
+    if let Ok(guard) = state.desktop_notify_item.lock() {
+        if let Some(item) = guard.as_ref() {
+            report(item.set_checked(updated.desktop_notify), "desktop notify check");
+        }
+    }
     log(&format!(
-        "schedule updated: short={}m/{}s, long={}m/{}m",
-        updated.short_every_mins, updated.short_break_secs, updated.long_every_mins, updated.long_break_mins
+        "schedule updated: short={}m/{}s, long={}m/{}m, desktop_notify={}",
+        updated.short_every_mins,
+        updated.short_break_secs,
+        updated.long_every_mins,
+        updated.long_break_mins,
+        updated.desktop_notify
     ));
     Ok(updated)
 }
 
-/// Resets the current quick-stretch counter while keeping cumulative long-break progress.
+/// Enables or disables silent Windows desktop notifications and syncs the tray menu checkmark.
 #[tauri::command]
-fn mark_quick_stretch(state: State<'_, AppState>) {
-    state.reset_short_req.store(true, Ordering::Relaxed);
+fn set_desktop_notify_cmd(state: State<'_, AppState>, enable: bool) -> Result<bool, String> {
+    let mut updated = state.settings.lock().map(|g| *g).unwrap_or_default();
+    updated.desktop_notify = enable;
+    persist_settings(updated)?;
+    if let Ok(mut g) = state.settings.lock() {
+        *g = updated;
+    }
+    if let Ok(guard) = state.desktop_notify_item.lock() {
+        if let Some(item) = guard.as_ref() {
+            report(item.set_checked(enable), "desktop notify check");
+        }
+    }
+    log(&format!("silent desktop notifications set to {enable}"));
+    Ok(enable)
+}
+
+/// Resets the current quick-stretch counter while keeping cumulative long-break progress.
+/// If clicked before the first stretch interval is reached, resets both so they never desync early.
+#[tauri::command]
+fn mark_quick_stretch(app: AppHandle, state: State<'_, AppState>) {
+    let break_after = state.cfg.lock().map(|g| g.break_after).unwrap_or(1800);
+    let long_secs = state.long_sitting_secs.load(Ordering::Relaxed);
+    if long_secs >= break_after {
+        state.reset_short_req.store(true, Ordering::Relaxed);
+        state.sitting_secs.store(0, Ordering::Relaxed);
+    } else {
+        state.reset_all_req.store(true, Ordering::Relaxed);
+        state.sitting_secs.store(0, Ordering::Relaxed);
+        state.long_sitting_secs.store(0, Ordering::Relaxed);
+        state.stretches_completed.store(0, Ordering::Relaxed);
+    }
+    if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
+        spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
+    }
+}
+
+/// Resets both the quick-stretch and 2-hour long-break timers to 0 immediately.
+#[tauri::command]
+fn reset_all_timers(app: AppHandle, state: State<'_, AppState>) {
+    state.reset_all_req.store(true, Ordering::Relaxed);
     state.sitting_secs.store(0, Ordering::Relaxed);
+    state.long_sitting_secs.store(0, Ordering::Relaxed);
+    state.stretches_completed.store(0, Ordering::Relaxed);
+    if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
+        spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
+    }
+}
+
+/// Toggles manual "In a meeting / presenting" hold mode (auto-expires after 90 min).
+#[tauri::command]
+fn toggle_meeting(state: State<'_, AppState>) -> bool {
+    let now = unix_secs();
+    let active = state.meeting_until.load(Ordering::Relaxed) > now;
+    let next = !active;
+    state.meeting_until.store(if next { now + MEETING_HOLD_SECS } else { 0 }, Ordering::Relaxed);
+    if let Ok(guard) = state.meeting_item.lock() {
+        if let Some(item) = guard.as_ref() {
+            report(item.set_checked(next), "meeting check");
+        }
+    }
+    next
+}
+
+/// Enables or disables "Start with Windows" from the dashboard UI and syncs the tray checkmark.
+#[tauri::command]
+fn set_autostart_cmd(state: State<'_, AppState>, enable: bool) -> Result<bool, String> {
+    set_autostart(enable)?;
+    let now_enabled = autostart_enabled();
+    if let Ok(guard) = state.autostart_item.lock() {
+        if let Some(item) = guard.as_ref() {
+            report(item.set_checked(now_enabled), "autostart check");
+        }
+    }
+    Ok(now_enabled)
 }
 
 /// Toggles the pause state from either the window or tray menu and syncs the tray label.
 #[tauri::command]
-fn toggle_pause(state: State<'_, AppState>) -> bool {
+fn toggle_pause(app: AppHandle, state: State<'_, AppState>) -> bool {
     let paused = !state.paused.fetch_xor(true, Ordering::Relaxed);
     if paused {
         state.sitting_secs.store(0, Ordering::Relaxed);
         state.long_sitting_secs.store(0, Ordering::Relaxed);
+        if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
+            spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
+        }
     }
     if let Ok(guard) = state.pause_item.lock() {
         if let Some(item) = guard.as_ref() {
@@ -261,9 +416,10 @@ fn toggle_pause(state: State<'_, AppState>) -> bool {
     paused
 }
 
-/// Sends a test buzz from the desktop window button.
+/// Sends a test buzz from the desktop window button (and silent PC notification if enabled).
 #[tauri::command]
 fn send_test_buzz(app: AppHandle) {
+    maybe_notify_desktop(&app, "Desk Pager test", "Silent PC notification + phone test buzz active.");
     spawn_deliver(&app, "Desk Pager test", "Test buzz from your laptop.".into());
 }
 
@@ -331,6 +487,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    ensure_aumid_registered();
     sensors::spawn();
 
     let first_run = topic.is_new;
@@ -338,26 +495,38 @@ fn main() {
     let cfg = settings.to_config(break_override);
     let app = tauri::Builder::default()
         .manage(AppState {
-            topic: topic.value,
+            topic: Mutex::new(topic.value),
             first_run,
             paused: AtomicBool::new(false),
+            meeting_until: AtomicU64::new(0),
             sending: Arc::new(AtomicBool::new(false)),
+            phone_alarm_active: AtomicBool::new(false),
             sitting_secs: AtomicU64::new(0),
             long_sitting_secs: AtomicU64::new(0),
+            stretches_completed: AtomicU64::new(0),
             reset_short_req: AtomicBool::new(false),
+            reset_all_req: AtomicBool::new(false),
             break_override,
             settings: Mutex::new(settings),
             cfg: Mutex::new(cfg),
             call_app: Mutex::new(None),
             pause_item: Mutex::new(None),
+            meeting_item: Mutex::new(None),
+            desktop_notify_item: Mutex::new(None),
+            autostart_item: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             pairing_info,
+            regenerate_pairing,
             pairing_rendered,
             app_status,
             get_settings,
             save_settings,
+            set_desktop_notify_cmd,
             mark_quick_stretch,
+            reset_all_timers,
+            toggle_meeting,
+            set_autostart_cmd,
             toggle_pause,
             send_test_buzz
         ])
@@ -365,6 +534,17 @@ fn main() {
             let status = MenuItem::with_id(app, "status", "Starting…", false, None::<&str>)?;
             let pair = MenuItem::with_id(app, MENU_PAIR, "Open Desk Pager…", true, None::<&str>)?;
             let test = MenuItem::with_id(app, MENU_TEST, "Send test buzz", true, None::<&str>)?;
+            let meeting = CheckMenuItem::with_id(
+                app, MENU_MEETING, "In a meeting / presenting", true, false, None::<&str>,
+            )?;
+            let desktop_notify = CheckMenuItem::with_id(
+                app,
+                MENU_DESKTOP_NOTIFY,
+                "Silent PC notifications",
+                true,
+                settings.desktop_notify,
+                None::<&str>,
+            )?;
             let pause = MenuItem::with_id(app, MENU_PAUSE, "Pause", true, None::<&str>)?;
             let autostart = CheckMenuItem::with_id(
                 app, MENU_AUTOSTART, "Start with Windows", true, autostart_enabled(), None::<&str>,
@@ -373,13 +553,35 @@ fn main() {
             let separator = PredefinedMenuItem::separator(app)?;
             let menu = Menu::with_items(
                 app,
-                &[&status, &separator, &pair, &test, &pause, &autostart, &separator, &quit],
+                &[
+                    &status,
+                    &separator,
+                    &pair,
+                    &test,
+                    &meeting,
+                    &desktop_notify,
+                    &pause,
+                    &autostart,
+                    &separator,
+                    &quit,
+                ],
             )?;
 
-            if let Ok(mut guard) = app.state::<AppState>().pause_item.lock() {
-                *guard = Some(pause.clone());
+            {
+                let state = app.state::<AppState>();
+                if let Ok(mut g) = state.pause_item.lock() {
+                    *g = Some(pause.clone());
+                }
+                if let Ok(mut g) = state.meeting_item.lock() {
+                    *g = Some(meeting.clone());
+                }
+                if let Ok(mut g) = state.desktop_notify_item.lock() {
+                    *g = Some(desktop_notify.clone());
+                }
+                if let Ok(mut g) = state.autostart_item.lock() {
+                    *g = Some(autostart.clone());
+                };
             }
-            let autostart_item = autostart.clone();
             let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().cloned().ok_or("bundle icon missing")?)
                 .tooltip("Desk Pager")
@@ -397,16 +599,24 @@ fn main() {
                 })
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     MENU_PAIR => open_pairing(app),
-                    MENU_TEST => spawn_deliver(app, "Desk Pager test", "Test buzz from your laptop.".into()),
+                    MENU_TEST => {
+                        maybe_notify_desktop(app, "Desk Pager test", "Silent PC notification + phone test buzz active.");
+                        spawn_deliver(app, "Desk Pager test", "Test buzz from your laptop.".into());
+                    }
+                    MENU_MEETING => {
+                        let _ = toggle_meeting(app.state::<AppState>());
+                    }
+                    MENU_DESKTOP_NOTIFY => {
+                        let state = app.state::<AppState>();
+                        let current = state.settings.lock().map(|g| g.desktop_notify).unwrap_or(true);
+                        let _ = set_desktop_notify_cmd(state, !current);
+                    }
                     MENU_PAUSE => {
-                        let _ = toggle_pause(app.state::<AppState>());
+                        let _ = toggle_pause(app.clone(), app.state::<AppState>());
                     }
                     MENU_AUTOSTART => {
                         let enable = !autostart_enabled();
-                        if let Err(e) = set_autostart(enable) {
-                            log(&format!("autostart change failed: {e}"));
-                        }
-                        report(autostart_item.set_checked(autostart_enabled()), "autostart check");
+                        let _ = set_autostart_cmd(app.state::<AppState>(), enable);
                     }
                     MENU_QUIT => app.exit(0),
                     _ => {}
@@ -419,11 +629,16 @@ fn main() {
                 open_pairing(app.handle());
             }
             if args.iter().any(|arg| arg == TEST_BUZZ_ARG) {
+                maybe_notify_desktop(
+                    app.handle(),
+                    "Desk Pager test",
+                    "Silent PC notification + phone test buzz active.",
+                );
                 spawn_deliver(app.handle(), "Desk Pager test", "Test buzz from your laptop.".into());
             }
             log(&format!(
-                "started, first run: {first_run}, break_after: {}s, long_break_after: {}s",
-                cfg.break_after, cfg.long_break_after
+                "started, first run: {first_run}, break_after: {}s, long_break_after: {}s, desktop_notify: {}",
+                cfg.break_after, cfg.long_break_after, settings.desktop_notify
             ));
             Ok(())
         })
@@ -443,10 +658,14 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
     let mut tracker = core::Tracker::default();
     let mut suspends_seen = sensors::suspend_count();
     let mut shown = String::new();
+    let mut first_tick = true;
     loop {
         let now = unix_secs();
         let state = app.state::<AppState>();
         let cfg = state.cfg.lock().map(|g| *g).unwrap_or_default();
+        if state.reset_all_req.swap(false, Ordering::Relaxed) {
+            tracker.reset();
+        }
         if state.reset_short_req.swap(false, Ordering::Relaxed) {
             tracker.reset_short();
         }
@@ -463,21 +682,40 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
             if suspends != suspends_seen {
                 suspends_seen = suspends;
                 tracker.reset();
+                state.meeting_until.store(0, Ordering::Relaxed);
+                if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
+                    spawn_deliver(app, CLEAR_TITLE, "Break started at PC".into());
+                }
+            }
+            let locked = sensors::is_locked();
+            if locked {
+                state.meeting_until.store(0, Ordering::Relaxed);
+                if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
+                    spawn_deliver(app, CLEAR_TITLE, "Break started at PC".into());
+                }
             }
             match sensors::idle_secs() {
                 Ok(idle) => {
-                    let apps = sensors::capture_apps().unwrap_or_default();
-                    let call_app = core::active_call_app(&apps);
-                    if let Ok(mut guard) = state.call_app.lock() {
-                        *guard = call_app.map(str::to_string);
+                    if idle >= cfg.short_break_secs.min(30)
+                        && state.phone_alarm_active.swap(false, Ordering::Relaxed)
+                    {
+                        spawn_deliver(app, CLEAR_TITLE, "Break started at PC".into());
                     }
-                    if let Some(alert) = tracker.tick(&cfg, now, idle, sensors::is_locked(), call_app.is_some()) {
+                    let apps = sensors::capture_apps().unwrap_or_default();
+                    let mic_app = core::active_call_app(&apps).map(str::to_string);
+                    let in_meeting = state.meeting_until.load(Ordering::Relaxed) > now;
+                    let hold_label = mic_app.clone().or_else(|| in_meeting.then(|| "Meeting mode".to_string()));
+                    if let Ok(mut guard) = state.call_app.lock() {
+                        *guard = hold_label.clone();
+                    }
+                    if let Some(alert) = tracker.tick(&cfg, now, idle, locked, hold_label.is_some()) {
                         match alert.kind {
                             core::AlertKind::QuickStretch => {
                                 let body = format!(
                                     "Sitting {} min — stand up for {}s, stretch your back, rest your eyes, and drink water.",
                                     alert.minutes, cfg.short_break_secs
                                 );
+                                maybe_notify_desktop(app, "Quick stretch & eye rest", &body);
                                 spawn_deliver(app, "Quick stretch & eye rest", body);
                             }
                             core::AlertKind::LongBreak => {
@@ -486,18 +724,23 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                                     alert.minutes,
                                     cfg.idle_away / 60
                                 );
+                                state.phone_alarm_active.store(true, Ordering::Relaxed);
+                                maybe_notify_desktop(app, "Time for a long break", &body);
                                 spawn_deliver(app, "Time for a long break", body);
                             }
                         }
                     }
                     state.sitting_secs.store(tracker.seconds(now), Ordering::Relaxed);
                     state.long_sitting_secs.store(tracker.long_seconds(now), Ordering::Relaxed);
+                    state
+                        .stretches_completed
+                        .store(u64::from(tracker.stretches_completed()), Ordering::Relaxed);
                     let short_min = tracker.minutes(now);
                     let short_target = (cfg.break_after / 60).max(1);
                     let long_min = tracker.long_minutes(now);
                     let long_target = (cfg.long_break_after / 60).max(1);
-                    match call_app {
-                        Some(name) => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m (call: {name})"),
+                    match hold_label {
+                        Some(name) => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m ({name})"),
                         None => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m"),
                     }
                 }
@@ -509,11 +752,61 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
         };
         if text != shown {
             report(status.set_text(&text), "status text");
-            report(tray.set_tooltip(Some(format!("Desk Pager — {text}"))), "tooltip");
+            if !first_tick {
+                report(tray.set_tooltip(Some(format!("Desk Pager — {text}"))), "tooltip");
+            }
             shown = text;
         }
+        first_tick = false;
         std::thread::sleep(POLL);
     }
+}
+
+/// Registers `DeskPager` in `HKCU\Software\Classes\AppUserModelId\DeskPager` so Windows 11 Notification Center accepts silent toast notifications without an MSIX installer.
+fn ensure_aumid_registered() {
+    if let Ok(key) = windows_registry::CURRENT_USER.create(AUMID_KEY) {
+        let _ = key.set_string("DisplayName", "Desk Pager");
+    }
+}
+
+/// Escapes XML special characters for Windows Toast XML templates.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Posts a silent native Windows 11 notification if the user has `desktop_notify` enabled.
+fn maybe_notify_desktop(app: &AppHandle, title: &str, body: &str) {
+    let enabled = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .map(|g| g.desktop_notify)
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    if let Err(e) = show_silent_desktop_notification(title, body) {
+        log(&format!("desktop notification failed: {e}"));
+    }
+}
+
+/// Displays a silent (`<audio silent="true"/>`), non-focus-stealing notification in the Windows 11 Notification Center.
+fn show_silent_desktop_notification(title: &str, body: &str) -> Result<(), String> {
+    let xml_str = format!(
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
+        escape_xml(title),
+        escape_xml(body)
+    );
+    let doc = XmlDocument::new().map_err(|e| e.to_string())?;
+    doc.LoadXml(&HSTRING::from(xml_str)).map_err(|e| e.to_string())?;
+    let toast = ToastNotification::CreateToastNotification(&doc).map_err(|e| e.to_string())?;
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(h!("DeskPager"))
+        .map_err(|e| e.to_string())?;
+    notifier.Show(&toast).map_err(|e| e.to_string())
 }
 
 /// Runs `work` on a background thread unless another send is already in flight.
@@ -541,7 +834,9 @@ where
 /// Spawns a non-overlapping background thread to deliver one buzz, so the timer thread never blocks.
 fn spawn_deliver(app: &AppHandle, title: &'static str, body: String) {
     let state = app.state::<AppState>();
-    let topic = state.topic.clone();
+    let Ok(guard) = state.topic.lock() else { return };
+    let topic = guard.clone();
+    drop(guard);
     if !spawn_single_flight(&state.sending, move || deliver(&topic, title, body)) {
         log(&format!("buzz skipped (send already in progress): {title}"));
     }
@@ -589,8 +884,9 @@ fn open_pairing(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let built = WebviewWindowBuilder::new(&app, PAIR_WINDOW, WebviewUrl::App("index.html".into()))
             .title("Desk Pager")
-            .inner_size(460.0, 650.0)
-            .resizable(false)
+            .inner_size(940.0, 650.0)
+            .min_inner_size(460.0, 580.0)
+            .resizable(true)
             .build();
         if let Err(e) = built {
             log(&format!("pairing window failed: {e}"));
@@ -718,20 +1014,23 @@ mod tests {
             short_break_secs: 30,
             long_every_mins: 120,
             long_break_mins: 15,
+            desktop_notify: false,
         };
         let text = custom.to_cfg_text();
         assert_eq!(ScheduleSettings::from_cfg_text(&text), custom);
 
         let out_of_range = ScheduleSettings {
-            short_every_mins: 5,
+            short_every_mins: 0,
             short_break_secs: 2,
-            long_every_mins: 10,
+            long_every_mins: 2,
             long_break_mins: 99,
+            desktop_notify: true,
         }
         .sanitized();
-        assert_eq!(out_of_range.short_every_mins, 15);
-        assert_eq!(out_of_range.short_break_secs, 10);
-        assert_eq!(out_of_range.long_every_mins, 45);
-        assert_eq!(out_of_range.long_break_mins, 30);
+        assert_eq!(out_of_range.short_every_mins, 1);
+        assert_eq!(out_of_range.short_break_secs, 5);
+        assert_eq!(out_of_range.long_every_mins, 5);
+        assert_eq!(out_of_range.long_break_mins, 60);
+        assert!(out_of_range.desktop_notify);
     }
 }

@@ -1,10 +1,14 @@
-// Drives the desktop dashboard, two-tier break schedule settings, and pairing view.
+// Drives the responsive Bento dashboard, radial gauges, custom schedule studio, and phone pairing view.
 const { invoke } = window.__TAURI__.core;
+
+const RING_CIRCUMFERENCE = 2 * Math.PI * 50; // r = 50 -> 314.159
 
 const tabBtnSchedule = document.getElementById("tab-btn-schedule");
 const tabBtnPair = document.getElementById("tab-btn-pair");
 const viewSchedule = document.getElementById("view-schedule");
 const viewPair = document.getElementById("view-pair");
+const desktopNotifyCheck = document.getElementById("desktop-notify-check");
+const autostartCheck = document.getElementById("autostart-check");
 
 const statusEl = document.getElementById("status");
 const scheduleFeedbackEl = document.getElementById("schedule-feedback");
@@ -12,22 +16,32 @@ const saveBadgeEl = document.getElementById("save-badge");
 const statePill = document.getElementById("state-pill");
 const stateLabel = document.getElementById("state-label");
 
+const shortRing = document.getElementById("short-ring");
+const shortTag = document.getElementById("short-tag");
 const shortSub = document.getElementById("short-Sub");
 const shortMeta = document.getElementById("short-meta");
-const shortFill = document.getElementById("short-fill");
+const shortRem = document.getElementById("short-rem");
+
+const longRing = document.getElementById("long-ring");
 const longSub = document.getElementById("long-sub");
 const longMeta = document.getElementById("long-meta");
-const longFill = document.getElementById("long-fill");
+const longRem = document.getElementById("long-rem");
 
 const callNote = document.getElementById("call-note");
 const pauseBtn = document.getElementById("toggle-pause");
+const meetingBtn = document.getElementById("toggle-meeting");
 const stretchBtn = document.getElementById("mark-stretch");
+const resetAllBtn = document.getElementById("reset-all");
 const testBtn = document.getElementById("test-buzz");
+const regenBtn = document.getElementById("regenerate");
 
-const shortEverySelect = document.getElementById("short-every");
-const shortDurationSelect = document.getElementById("short-duration");
-const longEverySelect = document.getElementById("long-every");
-const longDurationSelect = document.getElementById("long-duration");
+const shortEveryInput = document.getElementById("short-every");
+const shortDurationInput = document.getElementById("short-duration");
+const longEveryInput = document.getElementById("long-every");
+const longDurationInput = document.getElementById("long-duration");
+
+let regenConfirmPending = false;
+let saveDebounce = null;
 
 function switchTab(tab) {
   const isSchedule = tab === "schedule";
@@ -47,83 +61,122 @@ function showPairFeedback(msg) {
   statusEl.textContent = msg;
 }
 
-function ensureOption(selectEl, val) {
-  const str = String(val);
-  if (![...selectEl.options].some((o) => o.value === str)) {
-    const opt = document.createElement("option");
-    opt.value = str;
-    opt.textContent = `${str}`;
-    selectEl.appendChild(opt);
+function setRingProgress(circleEl, ratio) {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  const offset = RING_CIRCUMFERENCE * (1 - clamped);
+  circleEl.style.strokeDashoffset = `${offset.toFixed(2)}`;
+}
+
+function syncPresetChips() {
+  for (const group of document.querySelectorAll(".chips")) {
+    const targetId = group.getAttribute("data-for");
+    const input = document.getElementById(targetId);
+    if (!input) continue;
+    const currentVal = String(Number(input.value));
+    for (const chip of group.querySelectorAll(".chip")) {
+      chip.classList.toggle("active", chip.getAttribute("data-val") === currentVal);
+    }
   }
-  selectEl.value = str;
 }
 
 async function loadSettingsIntoForm() {
   const s = await invoke("get_settings");
-  ensureOption(shortEverySelect, s.short_every_mins);
-  ensureOption(shortDurationSelect, s.short_break_secs);
-  ensureOption(longEverySelect, s.long_every_mins);
-  ensureOption(longDurationSelect, s.long_break_mins);
+  shortEveryInput.value = s.short_every_mins;
+  shortDurationInput.value = s.short_break_secs;
+  longEveryInput.value = s.long_every_mins;
+  longDurationInput.value = s.long_break_mins;
+  desktopNotifyCheck.checked = Boolean(s.desktop_notify);
+  syncPresetChips();
 }
 
 async function saveScheduleFromForm() {
-  const shortEveryMins = Number(shortEverySelect.value);
-  const shortBreakSecs = Number(shortDurationSelect.value);
-  const longEveryMins = Number(longEverySelect.value);
-  const longBreakMins = Number(longDurationSelect.value);
+  const shortEveryMins = Math.max(1, Math.round(Number(shortEveryInput.value) || 30));
+  const shortBreakSecs = Math.max(5, Math.round(Number(shortDurationInput.value) || 30));
+  const longEveryMins = Math.max(5, Math.round(Number(longEveryInput.value) || 120));
+  const longBreakMins = Math.max(1, Math.round(Number(longDurationInput.value) || 10));
 
   const saved = await invoke("save_settings", {
     shortEveryMins,
     shortBreakSecs,
     longEveryMins,
     longBreakMins,
+    desktopNotify: desktopNotifyCheck.checked,
   });
-  ensureOption(shortEverySelect, saved.short_every_mins);
-  ensureOption(shortDurationSelect, saved.short_break_secs);
-  ensureOption(longEverySelect, saved.long_every_mins);
-  ensureOption(longDurationSelect, saved.long_break_mins);
-  saveBadgeEl.textContent = "Schedule saved";
+  shortEveryInput.value = saved.short_every_mins;
+  shortDurationInput.value = saved.short_break_secs;
+  longEveryInput.value = saved.long_every_mins;
+  longDurationInput.value = saved.long_break_mins;
+  desktopNotifyCheck.checked = Boolean(saved.desktop_notify);
+  syncPresetChips();
+  saveBadgeEl.textContent = "Saved live";
   showScheduleFeedback(
-    `Active: ${saved.short_every_mins}m quick stretch (${saved.short_break_secs}s) · ${saved.long_every_mins}m long break (${saved.long_break_mins}m).`
+    `Active: Quick stretch every ${saved.short_every_mins}m (${saved.short_break_secs}s pause) · Long break every ${saved.long_every_mins}m (${saved.long_break_mins}m walk).`
   );
   await refreshStatus();
+}
+
+function scheduleAutoSave() {
+  syncPresetChips();
+  if (saveDebounce) clearTimeout(saveDebounce);
+  saveDebounce = setTimeout(() => {
+    saveScheduleFromForm().catch((err) => showScheduleFeedback("Save failed: " + err));
+  }, 350);
 }
 
 async function refreshStatus() {
   try {
     const s = await invoke("app_status");
+    autostartCheck.checked = Boolean(s.autostart);
+    desktopNotifyCheck.checked = Boolean(s.desktop_notify);
+
     const shortTargetMin = Math.max(1, Math.round(s.break_after_secs / 60));
-    const shortPct = Math.min(100, Math.round((s.sitting_secs / Math.max(1, s.break_after_secs)) * 100));
-    shortFill.style.width = `${shortPct}%`;
-    shortSub.textContent = `· ${s.short_break_secs}s stretch, eyes & water`;
+    const shortRatio = s.sitting_secs / Math.max(1, s.break_after_secs);
+    setRingProgress(shortRing, shortRatio);
+    shortTag.textContent =
+      s.stretches_completed > 0
+        ? `Tier 1 · Quick Stretch (${s.stretches_completed} done)`
+        : "Tier 1 · Quick Stretch";
+    shortSub.textContent = `${s.short_break_secs}s pause · spine, eyes & water`;
 
     if (s.break_after_secs < 120) {
-      shortMeta.textContent = `${s.sitting_secs} / ${s.break_after_secs} s`;
+      shortMeta.textContent = `${s.sitting_secs}/${s.break_after_secs}s`;
+      const remS = Math.max(0, s.break_after_secs - s.sitting_secs);
+      shortRem.textContent = remS === 0 ? "Stretch due!" : `${remS}s left`;
     } else {
-      shortMeta.textContent = `${s.sitting_minutes} / ${shortTargetMin} min`;
+      shortMeta.textContent = `${s.sitting_minutes} / ${shortTargetMin}m`;
+      const remM = Math.max(0, shortTargetMin - s.sitting_minutes);
+      shortRem.textContent = remM === 0 ? "Stretch due!" : `${remM}m left`;
     }
 
     const longTargetMin = Math.max(1, Math.round(s.long_break_after_secs / 60));
-    const longPct = Math.min(100, Math.round((s.long_sitting_secs / Math.max(1, s.long_break_after_secs)) * 100));
-    longFill.style.width = `${longPct}%`;
-    longSub.textContent = `· ${s.long_break_mins} min walk & back recovery`;
-    longMeta.textContent = `${s.long_sitting_minutes} / ${longTargetMin} min`;
+    const longRatio = s.long_sitting_secs / Math.max(1, s.long_break_after_secs);
+    setRingProgress(longRing, longRatio);
+    longSub.textContent = `${s.long_break_mins} min walk & back recovery`;
+    longMeta.textContent = `${s.long_sitting_minutes} / ${longTargetMin}m`;
+    const longRemM = Math.max(0, longTargetMin - s.long_sitting_minutes);
+    longRem.textContent = longRemM === 0 ? "Long break due!" : `${longRemM}m left`;
+
+    meetingBtn.textContent = s.in_meeting ? "In a Meeting: On" : "In a Meeting: Off";
+    meetingBtn.classList.toggle("btn-meeting-on", Boolean(s.in_meeting));
 
     if (s.paused) {
       statePill.className = "pill pill-paused";
       stateLabel.textContent = "Paused";
-      pauseBtn.textContent = "Resume";
+      pauseBtn.textContent = "Resume Timer";
       callNote.hidden = true;
     } else if (s.call_app) {
       statePill.className = "pill pill-hold";
-      stateLabel.textContent = `In call · ${s.call_app}`;
-      pauseBtn.textContent = "Pause";
+      stateLabel.textContent = `Hold · ${s.call_app}`;
+      pauseBtn.textContent = "Pause Timer";
       callNote.hidden = false;
-      callNote.textContent = `Mic in use by ${s.call_app} — buzzes are held until 30 s after the call ends.`;
+      callNote.textContent =
+        s.call_app === "Meeting mode"
+          ? "Meeting hold is active — sitting time is tracked, and buzzes wait until you turn Meeting mode off."
+          : `Microphone in use by ${s.call_app} — buzzes are held until 30 s after the call ends.`;
     } else {
       statePill.className = "pill pill-active";
       stateLabel.textContent = "Active · Context-aware";
-      pauseBtn.textContent = "Pause";
+      pauseBtn.textContent = "Pause Timer";
       callNote.hidden = true;
     }
   } catch (_) {}
@@ -143,11 +196,55 @@ async function render() {
   }
 
   document.getElementById("copy").addEventListener("click", async () => {
+    const currentCode = document.getElementById("code").value;
     try {
-      await navigator.clipboard.writeText(info.code);
+      await navigator.clipboard.writeText(currentCode);
       showPairFeedback("Pairing code copied to clipboard.");
     } catch (_) {
       showPairFeedback("Select the code above and press Ctrl+C.");
+    }
+  });
+
+  regenBtn.addEventListener("click", async () => {
+    if (!regenConfirmPending) {
+      regenConfirmPending = true;
+      regenBtn.textContent = "Click again to confirm new code (unpairs current phone)";
+      showPairFeedback("Confirming will generate a new 128-bit secret topic.");
+      setTimeout(() => {
+        regenConfirmPending = false;
+        regenBtn.textContent = "Regenerate Secret Code";
+      }, 5000);
+      return;
+    }
+    regenConfirmPending = false;
+    regenBtn.textContent = "Regenerate Secret Code";
+    const updated = await invoke("regenerate_pairing");
+    document.getElementById("qr").innerHTML = updated.qr_svg;
+    document.getElementById("code").value = updated.code;
+    showPairFeedback("New secret pairing code generated. Scan or paste it on your phone.");
+  });
+
+  desktopNotifyCheck.addEventListener("change", async () => {
+    try {
+      const enabled = await invoke("set_desktop_notify_cmd", { enable: desktopNotifyCheck.checked });
+      desktopNotifyCheck.checked = Boolean(enabled);
+      showScheduleFeedback(
+        enabled
+          ? "Silent PC notifications enabled (shows in Windows Notification Center alongside phone buzz)."
+          : "Silent PC notifications disabled (mobile-only mode)."
+      );
+    } catch (err) {
+      showScheduleFeedback("Could not update PC notification preference: " + err);
+    }
+  });
+
+  autostartCheck.addEventListener("change", async () => {
+    try {
+      const enabled = await invoke("set_autostart_cmd", { enable: autostartCheck.checked });
+      autostartCheck.checked = Boolean(enabled);
+      showScheduleFeedback(enabled ? "Desk Pager will start automatically with Windows." : "Start with Windows disabled.");
+    } catch (err) {
+      showScheduleFeedback("Could not update autostart: " + err);
     }
   });
 
@@ -158,7 +255,19 @@ async function render() {
 
   stretchBtn.addEventListener("click", async () => {
     await invoke("mark_quick_stretch");
-    showScheduleFeedback("Quick stretch reset — 2-hour long break timer continues.");
+    showScheduleFeedback("Quick stretch reset to 0 — Long Break timer continues.");
+    await refreshStatus();
+  });
+
+  resetAllBtn.addEventListener("click", async () => {
+    await invoke("reset_all_timers");
+    showScheduleFeedback("Both Quick Stretch and Long Break timers reset to 0.");
+    await refreshStatus();
+  });
+
+  meetingBtn.addEventListener("click", async () => {
+    const on = await invoke("toggle_meeting");
+    showScheduleFeedback(on ? "Meeting hold enabled (auto-expires in 90 min)." : "Meeting hold turned off.");
     await refreshStatus();
   });
 
@@ -167,8 +276,36 @@ async function render() {
     await refreshStatus();
   });
 
-  for (const el of [shortEverySelect, shortDurationSelect, longEverySelect, longDurationSelect]) {
-    el.addEventListener("change", () => {
+  for (const stepBtn of document.querySelectorAll(".step-btn")) {
+    stepBtn.addEventListener("click", () => {
+      const targetId = stepBtn.getAttribute("data-target");
+      const delta = Number(stepBtn.getAttribute("data-delta") || 1);
+      const input = document.getElementById(targetId);
+      if (!input) return;
+      const min = Number(input.min || 1);
+      const max = Number(input.max || 360);
+      const next = Math.min(max, Math.max(min, (Number(input.value) || min) + delta));
+      input.value = next;
+      saveScheduleFromForm().catch((err) => showScheduleFeedback("Save failed: " + err));
+    });
+  }
+
+  for (const group of document.querySelectorAll(".chips")) {
+    const targetId = group.getAttribute("data-for");
+    const input = document.getElementById(targetId);
+    for (const chip of group.querySelectorAll(".chip")) {
+      chip.addEventListener("click", () => {
+        if (!input) return;
+        input.value = chip.getAttribute("data-val");
+        saveScheduleFromForm().catch((err) => showScheduleFeedback("Save failed: " + err));
+      });
+    }
+  }
+
+  for (const input of [shortEveryInput, shortDurationInput, longEveryInput, longDurationInput]) {
+    input.addEventListener("input", scheduleAutoSave);
+    input.addEventListener("change", () => {
+      if (saveDebounce) clearTimeout(saveDebounce);
       saveScheduleFromForm().catch((err) => showScheduleFeedback("Save failed: " + err));
     });
   }

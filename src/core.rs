@@ -101,6 +101,7 @@ pub struct Tracker {
     alerts_sent: u32,
     long_last_alert: Option<u64>,
     long_alerts_sent: u32,
+    stretches_completed: u32,
     last_call: Option<u64>,
     held_since: Option<u64>,
 }
@@ -117,6 +118,12 @@ impl Tracker {
         self.last_alert = None;
         self.alerts_sent = 0;
         self.held_since = None;
+        self.stretches_completed = self.stretches_completed.saturating_add(1);
+    }
+
+    /// Number of quick stretches completed within the current long-break session.
+    pub fn stretches_completed(&self) -> u32 {
+        self.stretches_completed
     }
 
     /// Whole seconds sat in the current quick-stretch cycle, 0 when away.
