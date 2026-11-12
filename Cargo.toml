@@ -1,6 +1,6 @@
 [package]
 name = "desk-pager"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Windows tray app that buzzes your phone after 45 minutes of continuous sitting"
 publish = false
