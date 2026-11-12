@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pair your phone</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>Pair your phone</h1>
+    <ol>
+      <li>Install the Desk Pager app on your Android phone.</li>
+      <li>Scan this code with the phone's camera, or paste the pairing code into the app.</li>
+    </ol>
+    <div id="qr" role="img" aria-label="Pairing QR code"></div>
+    <label for="code">Pairing code</label>
+    <input id="code" type="text" readonly>
+    <button id="copy" type="button">Copy code</button>
+    <p id="status" role="status" aria-live="polite"></p>
+    <p class="warn">Anyone with this code can send buzzes to your phone. Don't share it.</p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Desk Pager",
+  "version": "0.1.0",
+  "identifier": "np.com.ganeshbhatt.deskpager",
+  "build": { "frontendDist": "./dist" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": { "csp": "default-src 'self'; img-src 'self' data:" }
+  },
+  "bundle": { "active": false, "icon": ["icons/icon.ico"] }
+}
