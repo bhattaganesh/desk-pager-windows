@@ -12,17 +12,19 @@ The phone side is the Desk Pager Android app; the two talk through [ntfy.sh](htt
 
 Requires Windows 10/11 with the WebView2 runtime (preinstalled on Windows 11).
 
-## Rules
+## Two-Tier Break Rules (Customizable in App)
 
-| Rule | Value |
-|---|---|
-| First buzz | after 45 min of continuous use |
-| Repeat buzzes | every 10 min while you keep sitting, 3 per session at most |
-| A break | 5 min with no keyboard or mouse input, a lock of 2 min or more, or the PC sleeping |
-| Call hold | holds due buzzes while a call app uses the mic + 30 s grace after, up to 45 min max |
-| Pause | tray menu → **Pause** |
+| Rule | Default | Customizable Options |
+|---|---|---|
+| **Tier 1 — Quick Stretch (Stretch, Eyes & Water)** | every **30 min** (pause **30 s**) | `15, 20, 30, 40, 45, 60 min` · pause `20s, 30s, 45s, 60s` |
+| **Tier 2 — Long Break (Walk & Back Recovery)** | every **120 min / 2 hr** (break **10 min**) | `60, 90, 120, 150, 180 min` · break `5, 10, 15, 20 min` |
+| Repeat buzzes | every 10 min while you keep sitting, 3 per cycle at most | — |
+| Quick stretch reset | pausing keyboard/mouse for the stretch duration (`30 s`) after a buzz, or clicking **Took stretch** (resets Tier 1 while Tier 2 keeps counting) | — |
+| Full session reset | stepping away for the long-break duration (`10 min`), locking the PC for 2+ min, or PC sleep (resets both Tier 1 & Tier 2) | — |
+| Call hold | holds due buzzes while a call app uses the mic + 30 s grace after, up to 45 min max | — |
+| Pause | tray menu → **Pause** (or **Pause** button in the dashboard) | — |
 
-Dictation and system audio tools (`Wispr Flow.exe`, `VoiceAccess.exe`, `SpeechRuntime.exe`, `TextInputHost.exe`, `NVIDIA Broadcast.exe`, `audiodg.exe`) are ignored so voice typing does not delay buzzes. For listen-only meetings where your microphone is never opened, use **Pause**.
+Schedule preferences are saved locally in `%LOCALAPPDATA%\DeskPager\settings.cfg` and apply immediately without restarting. Dictation and system audio tools (`Wispr Flow.exe`, `VoiceAccess.exe`, `SpeechRuntime.exe`, `TextInputHost.exe`, `NVIDIA Broadcast.exe`, `audiodg.exe`) are ignored so voice typing does not delay buzzes. For listen-only meetings where your microphone is never opened, use **Pause**.
 
 ## Privacy and security
 

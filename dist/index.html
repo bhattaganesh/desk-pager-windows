@@ -9,56 +9,160 @@
 <body>
   <main class="shell">
     <header class="brand-header">
-      <div class="brand-icon" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
-          <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-        </svg>
+      <div class="brand-left">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Desk Pager</h1>
+          <p class="subtitle">Silent phone reminders for posture, eyes &amp; hydration</p>
+        </div>
       </div>
-      <div>
-        <h1>Desk Pager</h1>
-        <p class="subtitle">Stand-up reminders pushed to your Android phone</p>
-      </div>
+      <nav class="tabs" role="tablist" aria-label="Desk Pager views">
+        <button id="tab-btn-schedule" type="button" role="tab" aria-selected="true" class="tab-btn active">Tracker &amp; Schedule</button>
+        <button id="tab-btn-pair" type="button" role="tab" aria-selected="false" class="tab-btn">Phone Pairing</button>
+      </nav>
     </header>
 
-    <section class="card status-card" aria-label="Sitting status">
-      <div class="status-top">
-        <span id="state-pill" class="pill pill-active">
-          <span class="dot"></span>
-          <span id="state-label">Active · Tracking</span>
-        </span>
-        <span id="timer-meta" class="timer-meta">0 / 45 min</span>
-      </div>
-      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="progress-bar">
-        <div id="progress-fill" class="progress-fill"></div>
-      </div>
-      <p id="call-note" class="call-note" hidden></p>
-      <div class="action-row">
-        <button id="test-buzz" type="button" class="btn btn-primary">Send test buzz</button>
-        <button id="toggle-pause" type="button" class="btn btn-secondary">Pause timer</button>
-      </div>
-    </section>
+    <div id="view-schedule" class="tab-panel">
+      <section class="card status-card" aria-label="Sitting status">
+        <div class="status-top">
+          <span id="state-pill" class="pill pill-active">
+            <span class="dot"></span>
+            <span id="state-label">Active · Context-aware</span>
+          </span>
+          <span id="save-badge" class="save-badge" aria-live="polite">Schedule active</span>
+        </div>
 
-    <section class="card pair-card" aria-label="Phone pairing">
-      <div class="card-head">
-        <h2>Pair your Android phone</h2>
-        <span class="badge-secret">128-bit secret topic</span>
-      </div>
-      <ol class="steps">
-        <li>Open <strong>Desk Pager</strong> on your Android phone.</li>
-        <li>Scan this QR code with your phone's camera or paste the pairing code below, then tap <strong>Pair Phone</strong>.</li>
-      </ol>
-      <div class="qr-frame">
-        <div id="qr" role="img" aria-label="Pairing QR code"></div>
-      </div>
-      <label for="code" class="field-label">Pairing code</label>
-      <div class="code-row">
-        <input id="code" type="text" readonly spellcheck="false">
-        <button id="copy" type="button" class="btn btn-secondary">Copy</button>
-      </div>
-      <p id="status" class="feedback" role="status" aria-live="polite"></p>
-      <p class="warn">Anyone with this code can send notifications to your phone. Keep it private.</p>
-    </section>
+        <div class="tier-block">
+          <div class="tier-row">
+            <span class="tier-title">Quick Stretch <span id="short-Sub" class="tier-sub">· 30s stretch, eyes &amp; water</span></span>
+            <span id="short-meta" class="timer-meta">0 / 30 min</span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div id="short-fill" class="progress-fill"></div>
+          </div>
+        </div>
+
+        <div class="tier-block">
+          <div class="tier-row">
+            <span class="tier-title">Long Break <span id="long-sub" class="tier-sub">· 10 min walk &amp; back recovery</span></span>
+            <span id="long-meta" class="timer-meta">0 / 120 min</span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div id="long-fill" class="progress-fill progress-fill-long"></div>
+          </div>
+        </div>
+
+        <p id="call-note" class="call-note" hidden></p>
+
+        <div class="action-row">
+          <button id="test-buzz" type="button" class="btn btn-primary">Send test buzz</button>
+          <button id="mark-stretch" type="button" class="btn btn-secondary" title="Reset the quick stretch timer while keeping the 2-hour long break timer">Took stretch</button>
+          <button id="toggle-pause" type="button" class="btn btn-secondary">Pause</button>
+        </div>
+      </section>
+
+      <section class="card settings-card" aria-label="Break schedule settings">
+        <div class="card-head">
+          <h2>Customize Break Schedule</h2>
+          <span class="badge-secret">Auto-saved</span>
+        </div>
+
+        <div class="tier-config">
+          <div class="tier-config-head">
+            <span class="tier-badge tier-badge-short">1</span>
+            <div>
+              <h3>Quick Stretch, Eye Rest &amp; Water</h3>
+              <p class="tier-desc">Stand up briefly, stretch your spine, close your eyes, and sip water.</p>
+            </div>
+          </div>
+          <div class="grid-2">
+            <label class="field">
+              <span class="field-label">Remind every</span>
+              <select id="short-every">
+                <option value="15">15 minutes</option>
+                <option value="20">20 minutes</option>
+                <option value="30">30 minutes</option>
+                <option value="40">40 minutes</option>
+                <option value="45">45 minutes</option>
+                <option value="60">60 minutes (1 hr)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Stretch pause</span>
+              <select id="short-duration">
+                <option value="20">20 seconds</option>
+                <option value="30">30 seconds</option>
+                <option value="45">45 seconds</option>
+                <option value="60">1 minute</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="tier-divider"></div>
+
+        <div class="tier-config">
+          <div class="tier-config-head">
+            <span class="tier-badge tier-badge-long">2</span>
+            <div>
+              <h3>Long Break (Deep Lower-Back Recovery)</h3>
+              <p class="tier-desc">Step away from your desk after prolonged sitting across quick stretches.</p>
+            </div>
+          </div>
+          <div class="grid-2">
+            <label class="field">
+              <span class="field-label">Remind after sitting</span>
+              <select id="long-every">
+                <option value="60">1 hour (60 min)</option>
+                <option value="90">1.5 hours (90 min)</option>
+                <option value="120">2 hours (120 min)</option>
+                <option value="150">2.5 hours (150 min)</option>
+                <option value="180">3 hours (180 min)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Walk break length</span>
+              <select id="long-duration">
+                <option value="5">5 minutes</option>
+                <option value="10">10 minutes</option>
+                <option value="15">15 minutes</option>
+                <option value="20">20 minutes</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <p id="schedule-feedback" class="feedback" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="view-pair" class="tab-panel" hidden>
+      <section class="card pair-card" aria-label="Phone pairing">
+        <div class="card-head">
+          <h2>Pair your Android phone</h2>
+          <span class="badge-secret">128-bit secret topic</span>
+        </div>
+        <ol class="steps">
+          <li>Open <strong>Desk Pager</strong> on your Android phone.</li>
+          <li>Scan this QR code with your phone's camera or paste the pairing code below, then tap <strong>Pair Phone</strong>.</li>
+        </ol>
+        <div class="qr-frame">
+          <div id="qr" role="img" aria-label="Pairing QR code"></div>
+        </div>
+        <label for="code" class="field-label">Pairing code</label>
+        <div class="code-row">
+          <input id="code" type="text" readonly spellcheck="false">
+          <button id="copy" type="button" class="btn btn-secondary">Copy</button>
+        </div>
+        <p id="status" class="feedback" role="status" aria-live="polite"></p>
+        <p class="warn">Anyone with this code can send notifications to your phone. Keep it private.</p>
+      </section>
+    </div>
   </main>
   <script src="app.js"></script>
 </body>

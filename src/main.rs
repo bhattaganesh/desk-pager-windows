@@ -42,6 +42,7 @@ const SEND_RETRY_WAIT: Duration = Duration::from_secs(5);
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "DeskPager";
 const LOG_FILE: &str = "desk-pager.log";
+const SETTINGS_FILE: &str = "settings.cfg";
 const TEST_BUZZ_ARG: &str = "--test-buzz";
 const OPEN_PAIR_ARG: &str = "--open-pair";
 const BREAK_AFTER_SECS_ARG: &str = "--break-after-secs";
@@ -54,13 +55,96 @@ const MENU_PAUSE: &str = "pause";
 const MENU_AUTOSTART: &str = "autostart";
 const MENU_QUIT: &str = "quit";
 
+/// User-customizable two-tier break schedule (Quick Stretch + Long Break).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct ScheduleSettings {
+    /// Quick stretch interval in minutes (e.g. 20, 30, 40, 45, 60).
+    short_every_mins: u64,
+    /// Quick stretch pause duration in seconds (e.g. 20, 30, 45, 60).
+    short_break_secs: u64,
+    /// Cumulative sitting before a long break in minutes (e.g. 60, 90, 120, 180).
+    long_every_mins: u64,
+    /// Long break duration in minutes required to reset the long session (e.g. 5, 10, 15).
+    long_break_mins: u64,
+}
+
+impl Default for ScheduleSettings {
+    fn default() -> Self {
+        Self {
+            short_every_mins: 30,
+            short_break_secs: 30,
+            long_every_mins: 120,
+            long_break_mins: 10,
+        }
+    }
+}
+
+impl ScheduleSettings {
+    /// Clamps user-provided schedule values to safe ergonomic bounds.
+    fn sanitized(self) -> Self {
+        let short_every_mins = self.short_every_mins.clamp(15, 90);
+        let short_break_secs = self.short_break_secs.clamp(10, 180);
+        let long_every_mins = self.long_every_mins.clamp(short_every_mins.max(45), 240);
+        let long_break_mins = self.long_break_mins.clamp(3, 30);
+        Self {
+            short_every_mins,
+            short_break_secs,
+            long_every_mins,
+            long_break_mins,
+        }
+    }
+
+    /// Converts these schedule settings into a runtime `core::Config`.
+    fn to_config(self, break_override: Option<u64>) -> core::Config {
+        let s = self.sanitized();
+        core::Config {
+            break_after: break_override.unwrap_or(s.short_every_mins * 60),
+            short_break_secs: s.short_break_secs,
+            long_break_after: s.long_every_mins * 60,
+            idle_away: s.long_break_mins * 60,
+            ..core::Config::default()
+        }
+    }
+
+    /// Formats settings as `key=value` lines for `%LOCALAPPDATA%\DeskPager\settings.cfg`.
+    fn to_cfg_text(self) -> String {
+        let s = self.sanitized();
+        format!(
+            "short_every_mins={}\nshort_break_secs={}\nlong_every_mins={}\nlong_break_mins={}\n",
+            s.short_every_mins, s.short_break_secs, s.long_every_mins, s.long_break_mins
+        )
+    }
+
+    /// Parses `key=value` lines, falling back to defaults for any missing field.
+    fn from_cfg_text(raw: &str) -> Self {
+        let mut s = Self::default();
+        for line in raw.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let Ok(val) = v.trim().parse::<u64>() else { continue };
+            match k.trim() {
+                "short_every_mins" => s.short_every_mins = val,
+                "short_break_secs" => s.short_break_secs = val,
+                "long_every_mins" => s.long_every_mins = val,
+                "long_break_mins" => s.long_break_mins = val,
+                _ => {}
+            }
+        }
+        s.sanitized()
+    }
+}
+
 /// Shared between the tray menu, the pairing window and the timer thread.
 struct AppState {
     topic: String,
+    first_run: bool,
     paused: AtomicBool,
     sending: Arc<AtomicBool>,
     sitting_secs: AtomicU64,
-    break_after_secs: u64,
+    long_sitting_secs: AtomicU64,
+    reset_short_req: AtomicBool,
+    break_override: Option<u64>,
+    settings: Mutex<ScheduleSettings>,
+    cfg: Mutex<core::Config>,
     call_app: Mutex<Option<String>>,
     pause_item: Mutex<Option<MenuItem<tauri::Wry>>>,
 }
@@ -70,6 +154,7 @@ struct AppState {
 struct PairingInfo {
     code: String,
     qr_svg: String,
+    first_run: bool,
 }
 
 /// Live timer and sensor status for the desktop window.
@@ -79,6 +164,11 @@ struct StatusInfo {
     sitting_secs: u64,
     sitting_minutes: u64,
     break_after_secs: u64,
+    short_break_secs: u64,
+    long_sitting_secs: u64,
+    long_sitting_minutes: u64,
+    long_break_after_secs: u64,
+    long_break_mins: u64,
     call_app: Option<String>,
 }
 
@@ -88,21 +178,71 @@ fn pairing_info(state: State<'_, AppState>) -> Result<PairingInfo, String> {
     let link = format!("{PAIR_LINK_PREFIX}{}", state.topic);
     let qr = QrCode::new(link.as_bytes()).map_err(|e| format!("QR code failed: {e}"))?;
     let qr_svg = qr.render::<svg::Color>().min_dimensions(QR_SIZE_PX, QR_SIZE_PX).build();
-    Ok(PairingInfo { code: state.topic.clone(), qr_svg })
+    Ok(PairingInfo { code: state.topic.clone(), qr_svg, first_run: state.first_run })
 }
 
 /// Returns live timer state for the desktop dashboard window.
 #[tauri::command]
 fn app_status(state: State<'_, AppState>) -> StatusInfo {
     let sitting_secs = state.sitting_secs.load(Ordering::Relaxed);
+    let long_sitting_secs = state.long_sitting_secs.load(Ordering::Relaxed);
+    let cfg = state.cfg.lock().map(|g| *g).unwrap_or_default();
     let call_app = state.call_app.lock().ok().and_then(|g| g.clone());
     StatusInfo {
         paused: state.paused.load(Ordering::Relaxed),
         sitting_secs,
         sitting_minutes: sitting_secs / 60,
-        break_after_secs: state.break_after_secs,
+        break_after_secs: cfg.break_after,
+        short_break_secs: cfg.short_break_secs,
+        long_sitting_secs,
+        long_sitting_minutes: long_sitting_secs / 60,
+        long_break_after_secs: cfg.long_break_after,
+        long_break_mins: cfg.idle_away / 60,
         call_app,
     }
+}
+
+/// Returns the user's current break schedule settings.
+#[tauri::command]
+fn get_settings(state: State<'_, AppState>) -> ScheduleSettings {
+    state.settings.lock().map(|g| *g).unwrap_or_default()
+}
+
+/// Validates, persists, and immediately applies updated two-tier break schedule settings.
+#[tauri::command]
+fn save_settings(
+    state: State<'_, AppState>,
+    short_every_mins: u64,
+    short_break_secs: u64,
+    long_every_mins: u64,
+    long_break_mins: u64,
+) -> Result<ScheduleSettings, String> {
+    let updated = ScheduleSettings {
+        short_every_mins,
+        short_break_secs,
+        long_every_mins,
+        long_break_mins,
+    }
+    .sanitized();
+    persist_settings(updated)?;
+    if let Ok(mut g) = state.settings.lock() {
+        *g = updated;
+    }
+    if let Ok(mut g) = state.cfg.lock() {
+        *g = updated.to_config(state.break_override);
+    }
+    log(&format!(
+        "schedule updated: short={}m/{}s, long={}m/{}m",
+        updated.short_every_mins, updated.short_break_secs, updated.long_every_mins, updated.long_break_mins
+    ));
+    Ok(updated)
+}
+
+/// Resets the current quick-stretch counter while keeping cumulative long-break progress.
+#[tauri::command]
+fn mark_quick_stretch(state: State<'_, AppState>) {
+    state.reset_short_req.store(true, Ordering::Relaxed);
+    state.sitting_secs.store(0, Ordering::Relaxed);
 }
 
 /// Toggles the pause state from either the window or tray menu and syncs the tray label.
@@ -111,6 +251,7 @@ fn toggle_pause(state: State<'_, AppState>) -> bool {
     let paused = !state.paused.fetch_xor(true, Ordering::Relaxed);
     if paused {
         state.sitting_secs.store(0, Ordering::Relaxed);
+        state.long_sitting_secs.store(0, Ordering::Relaxed);
     }
     if let Ok(guard) = state.pause_item.lock() {
         if let Some(item) = guard.as_ref() {
@@ -130,6 +271,23 @@ fn send_test_buzz(app: AppHandle) {
 #[tauri::command]
 fn pairing_rendered(qr_shown: bool) {
     log(&format!("pairing window rendered, qr shown: {qr_shown}"));
+}
+
+/// Loads saved schedule settings from `%LOCALAPPDATA%\DeskPager\settings.cfg`, or defaults.
+fn load_settings() -> ScheduleSettings {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("DeskPager").join(SETTINGS_FILE))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|raw| ScheduleSettings::from_cfg_text(&raw))
+        .unwrap_or_default()
+}
+
+/// Writes schedule settings to `%LOCALAPPDATA%\DeskPager\settings.cfg` (never contains the secret topic).
+fn persist_settings(settings: ScheduleSettings) -> Result<(), String> {
+    let base = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA not set")?;
+    let dir = PathBuf::from(base).join("DeskPager");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(SETTINGS_FILE), settings.to_cfg_text()).map_err(|e| e.to_string())
 }
 
 /// Parses `--break-after-secs <10..=5400>` from command-line arguments.
@@ -176,17 +334,20 @@ fn main() {
     sensors::spawn();
 
     let first_run = topic.is_new;
-    let mut cfg = core::Config::default();
-    if let Some(secs) = break_override {
-        cfg.break_after = secs;
-    }
+    let settings = load_settings();
+    let cfg = settings.to_config(break_override);
     let app = tauri::Builder::default()
         .manage(AppState {
             topic: topic.value,
+            first_run,
             paused: AtomicBool::new(false),
             sending: Arc::new(AtomicBool::new(false)),
             sitting_secs: AtomicU64::new(0),
-            break_after_secs: cfg.break_after,
+            long_sitting_secs: AtomicU64::new(0),
+            reset_short_req: AtomicBool::new(false),
+            break_override,
+            settings: Mutex::new(settings),
+            cfg: Mutex::new(cfg),
             call_app: Mutex::new(None),
             pause_item: Mutex::new(None),
         })
@@ -194,6 +355,9 @@ fn main() {
             pairing_info,
             pairing_rendered,
             app_status,
+            get_settings,
+            save_settings,
+            mark_quick_stretch,
             toggle_pause,
             send_test_buzz
         ])
@@ -250,14 +414,17 @@ fn main() {
                 .build(app)?;
 
             let handle = app.handle().clone();
-            std::thread::spawn(move || run_timer(&handle, &status, &tray, cfg));
+            std::thread::spawn(move || run_timer(&handle, &status, &tray));
             if first_run || args.iter().any(|arg| arg == OPEN_PAIR_ARG) {
                 open_pairing(app.handle());
             }
             if args.iter().any(|arg| arg == TEST_BUZZ_ARG) {
                 spawn_deliver(app.handle(), "Desk Pager test", "Test buzz from your laptop.".into());
             }
-            log(&format!("started, first run: {first_run}, break_after: {}s", cfg.break_after));
+            log(&format!(
+                "started, first run: {first_run}, break_after: {}s, long_break_after: {}s",
+                cfg.break_after, cfg.long_break_after
+            ));
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -272,16 +439,21 @@ fn main() {
 }
 
 /// Samples the sensors every few seconds, drives the sitting timer and keeps the tray text current.
-fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon, cfg: core::Config) {
+fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
     let mut tracker = core::Tracker::default();
     let mut suspends_seen = sensors::suspend_count();
     let mut shown = String::new();
     loop {
         let now = unix_secs();
         let state = app.state::<AppState>();
+        let cfg = state.cfg.lock().map(|g| *g).unwrap_or_default();
+        if state.reset_short_req.swap(false, Ordering::Relaxed) {
+            tracker.reset_short();
+        }
         let text = if state.paused.load(Ordering::Relaxed) {
             tracker.reset();
             state.sitting_secs.store(0, Ordering::Relaxed);
+            state.long_sitting_secs.store(0, Ordering::Relaxed);
             if let Ok(mut guard) = state.call_app.lock() {
                 *guard = None;
             }
@@ -300,16 +472,33 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon, cf
                         *guard = call_app.map(str::to_string);
                     }
                     if let Some(alert) = tracker.tick(&cfg, now, idle, sensors::is_locked(), call_app.is_some()) {
-                        let body = format!(
-                            "You've been sitting for {} minutes. Stand up and move for a bit.",
-                            alert.minutes
-                        );
-                        spawn_deliver(app, "Time to stand up", body);
+                        match alert.kind {
+                            core::AlertKind::QuickStretch => {
+                                let body = format!(
+                                    "Sitting {} min — stand up for {}s, stretch your back, rest your eyes, and drink water.",
+                                    alert.minutes, cfg.short_break_secs
+                                );
+                                spawn_deliver(app, "Quick stretch & eye rest", body);
+                            }
+                            core::AlertKind::LongBreak => {
+                                let body = format!(
+                                    "At your desk for {} min — step away for {} min to walk and rest your lower back.",
+                                    alert.minutes,
+                                    cfg.idle_away / 60
+                                );
+                                spawn_deliver(app, "Time for a long break", body);
+                            }
+                        }
                     }
                     state.sitting_secs.store(tracker.seconds(now), Ordering::Relaxed);
+                    state.long_sitting_secs.store(tracker.long_seconds(now), Ordering::Relaxed);
+                    let short_min = tracker.minutes(now);
+                    let short_target = (cfg.break_after / 60).max(1);
+                    let long_min = tracker.long_minutes(now);
+                    let long_target = (cfg.long_break_after / 60).max(1);
                     match call_app {
-                        Some(name) => format!("Sitting: {} min (in call: {name})", tracker.minutes(now)),
-                        None => format!("Sitting: {} min", tracker.minutes(now)),
+                        Some(name) => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m (call: {name})"),
+                        None => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m"),
                     }
                 }
                 Err(e) => {
@@ -400,7 +589,7 @@ fn open_pairing(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let built = WebviewWindowBuilder::new(&app, PAIR_WINDOW, WebviewUrl::App("index.html".into()))
             .title("Desk Pager")
-            .inner_size(440.0, 680.0)
+            .inner_size(460.0, 650.0)
             .resizable(false)
             .build();
         if let Err(e) = built {
@@ -476,7 +665,10 @@ mod tests {
         for now in (0..2700).step_by(5) {
             assert_eq!(tracker.tick(&cfg, now, 0, false, false), None);
         }
-        assert_eq!(tracker.tick(&cfg, 2700, 0, false, false), Some(core::Alert { minutes: 45, number: 1 }));
+        assert_eq!(
+            tracker.tick(&cfg, 2700, 0, false, false),
+            Some(core::Alert { kind: core::AlertKind::QuickStretch, minutes: 45, number: 1 })
+        );
 
         let sending = Arc::new(AtomicBool::new(false));
         let ran = Arc::new(AtomicU32::new(0));
@@ -517,5 +709,29 @@ mod tests {
         assert!(parse_break_after_secs(&args(&["desk-pager", "--break-after-secs", "9"])).is_err());
         assert!(parse_break_after_secs(&args(&["desk-pager", "--break-after-secs", "5401"])).is_err());
         assert!(parse_break_after_secs(&args(&["desk-pager", "--break-after-secs", "abc"])).is_err());
+    }
+
+    #[test]
+    fn round_trips_and_clamps_schedule_settings() {
+        let custom = ScheduleSettings {
+            short_every_mins: 45,
+            short_break_secs: 30,
+            long_every_mins: 120,
+            long_break_mins: 15,
+        };
+        let text = custom.to_cfg_text();
+        assert_eq!(ScheduleSettings::from_cfg_text(&text), custom);
+
+        let out_of_range = ScheduleSettings {
+            short_every_mins: 5,
+            short_break_secs: 2,
+            long_every_mins: 10,
+            long_break_mins: 99,
+        }
+        .sanitized();
+        assert_eq!(out_of_range.short_every_mins, 15);
+        assert_eq!(out_of_range.short_break_secs, 10);
+        assert_eq!(out_of_range.long_every_mins, 45);
+        assert_eq!(out_of_range.long_break_mins, 30);
     }
 }
