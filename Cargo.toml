@@ -1,6 +1,6 @@
 [package]
 name = "desk-pager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Windows tray app that buzzes your phone after 45 minutes of continuous sitting"
 publish = false
@@ -18,8 +18,10 @@ getrandom = "0.4"
 windows-registry = "=0.100.0"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Media_Audio",
     "Win32_Security",
     "Win32_Security_Credentials",
+    "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",

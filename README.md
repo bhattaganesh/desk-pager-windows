@@ -19,9 +19,10 @@ Requires Windows 10/11 with the WebView2 runtime (preinstalled on Windows 11).
 | First buzz | after 45 min of continuous use |
 | Repeat buzzes | every 10 min while you keep sitting, 3 per session at most |
 | A break | 5 min with no keyboard or mouse input, a lock of 2 min or more, or the PC sleeping |
+| Call hold | holds due buzzes while a call app uses the mic + 30 s grace after, up to 45 min max |
 | Pause | tray menu → **Pause** |
 
-There is no call or meeting detection in this version: use **Pause** before a long call.
+Dictation and system audio tools (`Wispr Flow.exe`, `VoiceAccess.exe`, `SpeechRuntime.exe`, `TextInputHost.exe`, `NVIDIA Broadcast.exe`, `audiodg.exe`) are ignored so voice typing does not delay buzzes. For listen-only meetings where your microphone is never opened, use **Pause**.
 
 ## Privacy and security
 
@@ -39,6 +40,6 @@ cargo test --features tauri/custom-protocol
 cargo build --release --features tauri/custom-protocol
 ```
 
-The exe is `target\release\desk-pager.exe`. `desk-pager.exe --test-buzz` sends one test buzz at start-up.
+The exe is `target\release\desk-pager.exe`. `desk-pager.exe --test-buzz` sends one test buzz at start-up; `desk-pager.exe --break-after-secs 60` overrides the first-buzz threshold (`10..=5400` s) for end-to-end testing.
 
 The exe is not code-signed, so Windows SmartScreen may warn the first time it runs.

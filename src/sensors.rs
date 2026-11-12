@@ -1,4 +1,4 @@
-//! Windows inputs for the timer: idle time, session lock state and suspend notifications.
+//! Windows inputs for the timer: idle time, session lock state, suspend notifications and active mic capture.
 
 use std::{
     ffi::c_void,
@@ -6,14 +6,23 @@ use std::{
 };
 
 use windows::{
-    core::{w, Error, Result},
+    core::{w, Error, Interface, Result, HRESULT, PWSTR},
     Win32::{
-        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Media::Audio::{
+            eCapture, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
+            IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        },
         System::{
+            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
             LibraryLoader::GetModuleHandleW,
             Power::{RegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS},
             RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION},
             SystemInformation::GetTickCount,
+            Threading::{
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
         },
         UI::{
             Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
@@ -26,8 +35,23 @@ use windows::{
     },
 };
 
+const MAX_PATH_WIDE: usize = 1024;
+const RPC_E_CHANGED_MODE_HR: HRESULT = HRESULT(0x80010106u32 as i32);
+
 static LOCKED: AtomicBool = AtomicBool::new(false);
 static SUSPENDS: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static COM_INIT: Result<()> = {
+        // SAFETY: called once per thread before creating COM objects; RPC_E_CHANGED_MODE means COM is already initialised.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_ok() || hr == RPC_E_CHANGED_MODE_HR {
+            Ok(())
+        } else {
+            Err(Error::from(hr))
+        }
+    };
+}
 
 /// Starts the listener thread for lock/unlock and suspend events.
 pub fn spawn() {
@@ -56,6 +80,52 @@ pub fn idle_secs() -> Result<u64> {
         GetLastInputInfo(&mut info).ok()?;
         // Both values are 32-bit tick counts, so wrapping subtraction survives the 49-day rollover.
         Ok(u64::from(GetTickCount().wrapping_sub(info.dwTime)) / 1000)
+    }
+}
+
+/// Executable names owning an Active audio session on any active microphone capture endpoint.
+pub fn capture_apps() -> Result<Vec<String>> {
+    COM_INIT.with(|init| init.clone())?;
+    let mut active = Vec::new();
+    // SAFETY: COM is initialised for this thread; every interface lives within its local scope.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let devices = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+        for d in 0..devices.GetCount()? {
+            let manager: IAudioSessionManager2 = devices.Item(d)?.Activate(CLSCTX_ALL, None)?;
+            let sessions = manager.GetSessionEnumerator()?;
+            for s in 0..sessions.GetCount()? {
+                let control = sessions.GetSession(s)?;
+                if control.GetState()? != AudioSessionStateActive {
+                    continue;
+                }
+                let pid = control.cast::<IAudioSessionControl2>()?.GetProcessId()?;
+                active.push(process_name(pid));
+            }
+        }
+    }
+    active.sort();
+    active.dedup();
+    Ok(active)
+}
+
+fn process_name(pid: u32) -> String {
+    // SAFETY: `buf` outlives `QueryFullProcessImageNameW` and `handle` is closed before returning.
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return format!("pid:{pid}");
+        };
+        let mut buf = [0u16; MAX_PATH_WIDE];
+        let mut len = buf.len() as u32;
+        let queried = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(handle);
+        match queried {
+            Ok(()) => {
+                let path = String::from_utf16_lossy(&buf[..len as usize]);
+                path.rsplit('\\').next().unwrap_or(&path).to_string()
+            }
+            Err(_) => format!("pid:{pid}"),
+        }
     }
 }
 
