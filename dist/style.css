@@ -39,12 +39,15 @@
 }
 
 * { box-sizing: border-box; }
+html, body {
+  overflow: hidden;
+}
 body {
   margin: 0;
-  padding: 16px;
+  padding: 14px 16px;
   background: var(--bg);
   color: var(--text);
-  line-height: 1.45;
+  line-height: 1.42;
   user-select: none;
 }
 .shell {
@@ -169,9 +172,9 @@ h2 { font-size: 0.95rem; font-weight: 600; margin: 0; }
 }
 .steps li + li { margin-top: 3px; }
 .qr-frame {
-  width: 216px;
-  height: 216px;
-  margin: 0 auto 12px;
+  width: 196px;
+  height: 196px;
+  margin: 0 auto 10px;
   background: #ffffff;
   border: 1px solid var(--border);
   border-radius: 12px;
