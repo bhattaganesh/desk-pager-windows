@@ -14,7 +14,7 @@ use windows::{
             IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
         },
         System::{
-            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
             Power::{RegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS},
             RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION},
@@ -43,8 +43,8 @@ static SUSPENDS: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     static COM_INIT: Result<()> = {
-        // SAFETY: called once per thread before creating COM objects; RPC_E_CHANGED_MODE means COM is already initialised.
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        // SAFETY: STA is required on the timer thread because Shell_NotifyIconW (tray tooltip) fails under MTA.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if hr.is_ok() || hr == RPC_E_CHANGED_MODE_HR {
             Ok(())
         } else {
