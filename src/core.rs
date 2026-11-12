@@ -176,6 +176,20 @@ impl Tracker {
         self.long_seconds(now) / 60
     }
 
+    /// Remaining seconds in the current quick-stretch pause window (`short_break_secs` after a Tier 1 buzz), if active.
+    ///
+    /// * `cfg` - Timing configuration.
+    /// * `now` - Current timestamp in seconds.
+    pub fn stretch_pause_remaining(&self, cfg: &Config, now: u64) -> u64 {
+        if self.alerts_sent == 0 {
+            return 0;
+        }
+        self.last_alert.map_or(0, |last| {
+            let elapsed = now.saturating_sub(last);
+            cfg.short_break_secs.saturating_sub(elapsed)
+        })
+    }
+
     /// Feeds one sample and returns a buzz when a quick stretch or long break is due and not held by a call.
     ///
     /// * `cfg` - Timing configuration.
@@ -204,11 +218,17 @@ impl Tracker {
             return None;
         }
 
-        // If a quick-stretch reminder has already fired, an idle pause of `short_break_secs`
-        // (standing up to stretch, rest eyes, drink water) resets the quick-stretch cycle only.
-        if self.alerts_sent > 0 && idle_secs >= cfg.short_break_secs {
+        // Complete the quick-stretch pause once `short_break_secs` elapses (or via idle pause),
+        // rolling Tier 1 cleanly back to 0/30m while Tier 2 (Long Break) continues accumulating.
+        let pause_elapsed = cfg.long_break_after > 0
+            && cfg.short_break_secs > 0
+            && self.last_alert.is_some_and(|last| now.saturating_sub(last) >= cfg.short_break_secs);
+        let idle_paused = cfg.short_break_secs > 0 && idle_secs >= cfg.short_break_secs;
+        if self.alerts_sent > 0 && (idle_paused || pause_elapsed) {
             self.reset_short();
-            return None;
+            if idle_paused {
+                return None;
+            }
         }
 
         if in_call {
@@ -216,7 +236,7 @@ impl Tracker {
         }
 
         // Do not start a new sitting cycle while the user is still idle/away after a break.
-        let active_now = in_call || idle_secs < cfg.short_break_secs;
+        let active_now = in_call || cfg.short_break_secs == 0 || idle_secs < cfg.short_break_secs;
         if self.long_sitting_since.is_none() && !active_now {
             return None;
         }
@@ -292,7 +312,8 @@ mod tests {
 
     #[test]
     fn buzzes_at_45_minutes_then_every_10_up_to_three_and_long_break_at_2h() {
-        let (cfg, mut t) = (Config::default(), Tracker::default());
+        let cfg = Config { short_break_secs: 0, ..Config::default() };
+        let mut t = Tracker::default();
         let buzzes: Vec<(u64, AlertKind, u32)> = (0..=3 * 3600)
             .step_by(STEP as usize)
             .filter_map(|now| t.tick(&cfg, now, 0, false, false).map(|a| (now, a.kind, a.number)))
@@ -308,6 +329,32 @@ mod tests {
                 (8400, AlertKind::LongBreak, 3),
             ]
         );
+    }
+
+    #[test]
+    fn stretch_pause_window_rolls_over_short_cycle_even_if_mouse_moves() {
+        let cfg = Config {
+            break_after: 30 * 60,
+            short_break_secs: 60,
+            long_break_after: 120 * 60,
+            idle_away: 10 * 60,
+            ..Config::default()
+        };
+        let mut t = Tracker::default();
+        // Sit 30m -> QuickStretch #1 at 1800s.
+        assert_eq!(sit(&mut t, &cfg, 0, 1800), vec![(1800, 1)]);
+        assert_eq!(t.stretch_pause_remaining(&cfg, 1800), 60);
+        assert_eq!(t.stretch_pause_remaining(&cfg, 1830), 30);
+
+        // Even if the mouse moves during the 60s stretch pause (idle = 0), at 1860s (31m) Tier 1 rolls over to 0/30m (1 done).
+        for now in (1805..=1980).step_by(5) {
+            assert_eq!(t.tick(&cfg, now, 0, false, false), None);
+        }
+        assert_eq!(t.stretches_completed(), 1);
+        assert_eq!(t.stretch_pause_remaining(&cfg, 1980), 0);
+        // At 33m (1980s), Tier 1 is at 2 / 30m while Tier 2 is at 33 / 120m!
+        assert_eq!(t.minutes(1980), 2);
+        assert_eq!(t.long_minutes(1980), 33);
     }
 
     #[test]
@@ -480,7 +527,8 @@ mod tests {
 
     #[test]
     fn call_hold_caps_at_45_minutes_and_allows_realerts() {
-        let (cfg, mut t) = (Config::default(), Tracker::default());
+        let cfg = Config { short_break_secs: 0, ..Config::default() };
+        let mut t = Tracker::default();
         sit(&mut t, &cfg, 0, 2695);
         for now in (2700..=5395).step_by(5) {
             assert_eq!(t.tick(&cfg, now, 0, false, true), None, "must hold up to hold_max at {now}");

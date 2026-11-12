@@ -135,33 +135,38 @@ async function refreshStatus() {
     }
 
     const shortTargetMin = Math.max(1, Math.round(s.break_after_secs / 60));
-    const shortRatio = s.sitting_secs / Math.max(1, s.break_after_secs);
-    setRingProgress(shortRing, shortRatio);
     shortTag.textContent =
       s.stretches_completed > 0
         ? `Tier 1 · Quick Stretch (${s.stretches_completed} done)`
         : "Tier 1 · Quick Stretch";
     shortSub.textContent = `${s.short_break_secs}s pause · spine, eyes & water`;
 
-    if (s.sitting_secs >= s.break_after_secs && s.idle_secs >= 5) {
-      shortMeta.textContent = `${Math.min(s.idle_secs, s.short_break_secs)}/${s.short_break_secs}s`;
-      shortRem.textContent = "Stretching…";
+    if (s.stretch_pause_rem_secs > 0) {
+      const pauseRatio = s.stretch_pause_rem_secs / Math.max(1, s.short_break_secs);
+      setRingProgress(shortRing, pauseRatio);
+      shortMeta.textContent = `${s.stretch_pause_rem_secs}s / ${s.short_break_secs}s`;
+      shortRem.textContent = "Stretch pause…";
     } else if (s.break_after_secs < 120) {
-      shortMeta.textContent = `${s.sitting_secs}/${s.break_after_secs}s`;
-      const remS = Math.max(0, s.break_after_secs - s.sitting_secs);
+      const shownSecs = Math.min(s.sitting_secs, s.break_after_secs);
+      setRingProgress(shortRing, shownSecs / Math.max(1, s.break_after_secs));
+      shortMeta.textContent = `${shownSecs}/${s.break_after_secs}s`;
+      const remS = Math.max(0, s.break_after_secs - shownSecs);
       shortRem.textContent = remS === 0 ? "Stretch due!" : `${remS}s left`;
     } else {
-      shortMeta.textContent = `${s.sitting_minutes} / ${shortTargetMin}m`;
-      const remM = Math.max(0, shortTargetMin - s.sitting_minutes);
+      const shownShortMin = Math.min(s.sitting_minutes, shortTargetMin);
+      setRingProgress(shortRing, Math.min(1, s.sitting_secs / Math.max(1, s.break_after_secs)));
+      shortMeta.textContent = `${shownShortMin} / ${shortTargetMin}m`;
+      const remM = Math.max(0, shortTargetMin - shownShortMin);
       shortRem.textContent = remM === 0 ? "Stretch due!" : `${remM}m left`;
     }
 
     const longTargetMin = Math.max(1, Math.round(s.long_break_after_secs / 60));
-    const longRatio = s.long_sitting_secs / Math.max(1, s.long_break_after_secs);
+    const shownLongMin = Math.min(s.long_sitting_minutes, longTargetMin);
+    const longRatio = Math.min(1, s.long_sitting_secs / Math.max(1, s.long_break_after_secs));
     setRingProgress(longRing, longRatio);
     longSub.textContent = `${s.long_break_mins} min walk & back recovery`;
-    longMeta.textContent = `${s.long_sitting_minutes} / ${longTargetMin}m`;
-    const longRemM = Math.max(0, longTargetMin - s.long_sitting_minutes);
+    longMeta.textContent = `${shownLongMin} / ${longTargetMin}m`;
+    const longRemM = Math.max(0, longTargetMin - shownLongMin);
     if (s.long_sitting_secs >= s.long_break_after_secs && s.idle_secs >= 10) {
       longRem.textContent = `Break ${Math.floor(s.idle_secs / 60)}/${s.long_break_mins}m`;
     } else {

@@ -192,6 +192,7 @@ struct AppState {
     idle_secs: AtomicU64,
     sitting_secs: AtomicU64,
     long_sitting_secs: AtomicU64,
+    stretch_pause_rem_secs: AtomicU64,
     stretches_completed: AtomicU64,
     reset_short_req: AtomicBool,
     reset_all_req: AtomicBool,
@@ -227,6 +228,7 @@ struct StatusInfo {
     sitting_minutes: u64,
     break_after_secs: u64,
     short_break_secs: u64,
+    stretch_pause_rem_secs: u64,
     long_sitting_secs: u64,
     long_sitting_minutes: u64,
     long_break_after_secs: u64,
@@ -305,6 +307,7 @@ fn app_status(state: State<'_, AppState>) -> StatusInfo {
         sitting_minutes: sitting_secs / 60,
         break_after_secs: cfg.break_after,
         short_break_secs: cfg.short_break_secs,
+        stretch_pause_rem_secs: state.stretch_pause_rem_secs.load(Ordering::Relaxed),
         long_sitting_secs,
         long_sitting_minutes: long_sitting_secs / 60,
         long_break_after_secs: cfg.long_break_after,
@@ -398,6 +401,7 @@ fn mark_quick_stretch(app: AppHandle, state: State<'_, AppState>) {
     if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
         spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
     }
+    state.stretch_pause_rem_secs.store(0, Ordering::Relaxed);
 }
 
 /// Resets both the quick-stretch and 2-hour long-break timers to 0 immediately.
@@ -406,6 +410,7 @@ fn reset_all_timers(app: AppHandle, state: State<'_, AppState>) {
     state.reset_all_req.store(true, Ordering::Relaxed);
     state.sitting_secs.store(0, Ordering::Relaxed);
     state.long_sitting_secs.store(0, Ordering::Relaxed);
+    state.stretch_pause_rem_secs.store(0, Ordering::Relaxed);
     state.stretches_completed.store(0, Ordering::Relaxed);
     if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
         spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
@@ -562,6 +567,7 @@ fn main() {
             idle_secs: AtomicU64::new(0),
             sitting_secs: AtomicU64::new(0),
             long_sitting_secs: AtomicU64::new(0),
+            stretch_pause_rem_secs: AtomicU64::new(0),
             stretches_completed: AtomicU64::new(0),
             reset_short_req: AtomicBool::new(false),
             reset_all_req: AtomicBool::new(false),
@@ -817,12 +823,15 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                     state.sitting_secs.store(tracker.seconds(now), Ordering::Relaxed);
                     state.long_sitting_secs.store(tracker.long_seconds(now), Ordering::Relaxed);
                     state
+                        .stretch_pause_rem_secs
+                        .store(tracker.stretch_pause_remaining(&cfg, now), Ordering::Relaxed);
+                    state
                         .stretches_completed
                         .store(u64::from(tracker.stretches_completed()), Ordering::Relaxed);
-                    let short_min = tracker.minutes(now);
                     let short_target = (cfg.break_after / 60).max(1);
-                    let long_min = tracker.long_minutes(now);
+                    let short_min = tracker.minutes(now).min(short_target);
                     let long_target = (cfg.long_break_after / 60).max(1);
+                    let long_min = tracker.long_minutes(now).min(long_target);
                     match hold_label {
                         Some(name) => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m ({name})"),
                         None => format!("Stretch {short_min}/{short_target}m · Long {long_min}/{long_target}m"),
@@ -1246,11 +1255,11 @@ mod tests {
             ran2.fetch_add(1, Ordering::Relaxed);
         }));
 
-        // Timer ticks on schedule 5s later; sitting session stays intact and reaches 46 min at 2760s.
+        // Timer ticks on schedule 5s later; cumulative long-break session stays intact and reaches 46 min at 2760s.
         for now in (2705..=2760).step_by(5) {
             assert_eq!(tracker.tick(&cfg, now, 0, false, false), None);
         }
-        assert_eq!(tracker.minutes(2760), 46);
+        assert_eq!(tracker.long_minutes(2760), 46);
 
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(ran.load(Ordering::Relaxed), 1);
