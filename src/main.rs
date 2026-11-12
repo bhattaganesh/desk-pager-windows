@@ -219,9 +219,21 @@ struct StatusInfo {
     call_app: Option<String>,
 }
 
-/// Builds a `PairingInfo` payload with SVG QR code from a topic string.
+/// Builds a `PairingInfo` payload with SVG QR code from a topic string (including sanitized PC hostname).
 fn build_pairing_info(topic: &str, first_run: bool) -> Result<PairingInfo, String> {
-    let link = format!("{PAIR_LINK_PREFIX}{topic}");
+    let pc_name = std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(24)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
+    let link = match pc_name {
+        Some(name) => format!("{PAIR_LINK_PREFIX}{topic}&name={name}"),
+        None => format!("{PAIR_LINK_PREFIX}{topic}"),
+    };
     let qr = QrCode::new(link.as_bytes()).map_err(|e| format!("QR code failed: {e}"))?;
     let qr_svg = qr.render::<svg::Color>().min_dimensions(QR_SIZE_PX, QR_SIZE_PX).build();
     Ok(PairingInfo { code: topic.to_string(), qr_svg, first_run })
