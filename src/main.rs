@@ -719,19 +719,11 @@ fn main() {
             ));
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if !window.app_handle().state::<AppState>().quitting.load(Ordering::SeqCst) {
-                    api.prevent_close();
-                    report(window.hide(), "window hide to tray");
-                }
-            }
-        })
         .build(tauri::generate_context!())
         .expect("failed to build tauri app");
 
     app.run(|app_handle, event| {
-        // Stay alive in the system tray when windows close; only exit when MENU_QUIT sets `quitting = true`.
+        // Closing the dashboard destroys it (freeing WebView2); the tray app lives on until MENU_QUIT.
         if let RunEvent::ExitRequested { api, .. } = event {
             if !app_handle.state::<AppState>().quitting.load(Ordering::SeqCst) {
                 api.prevent_exit();

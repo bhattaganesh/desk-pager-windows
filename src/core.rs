@@ -206,7 +206,7 @@ impl Tracker {
         }
 
         self.locked_since = if locked { self.locked_since.or(Some(now)) } else { None };
-        let lock_break = self.locked_since.is_some_and(|since| now - since >= cfg.lock_break);
+        let lock_break = self.locked_since.is_some_and(|since| now.saturating_sub(since) >= cfg.lock_break);
         if lock_break || idle_secs >= cfg.idle_away {
             let locked_since = self.locked_since;
             self.reset();
@@ -241,25 +241,25 @@ impl Tracker {
             return None;
         }
         let long_since = *self.long_sitting_since.get_or_insert(now);
-        let long_sat = now - long_since;
+        let long_sat = now.saturating_sub(long_since);
 
         if self.sitting_since.is_none() && !active_now {
             return None;
         }
         let short_since = *self.sitting_since.get_or_insert(now);
-        let short_sat = now - short_since;
+        let short_sat = now.saturating_sub(short_since);
 
         let long_enabled = cfg.long_break_after > 0;
         let long_due = long_enabled
             && match self.long_last_alert {
                 None => long_sat >= cfg.long_break_after,
-                Some(last) => self.long_alerts_sent < cfg.max_alerts && now - last >= cfg.realert_every,
+                Some(last) => self.long_alerts_sent < cfg.max_alerts && now.saturating_sub(last) >= cfg.realert_every,
             };
 
         let short_due = (!long_enabled || long_sat < cfg.long_break_after)
             && match self.last_alert {
                 None => short_sat >= cfg.break_after,
-                Some(last) => self.alerts_sent < cfg.max_alerts && now - last >= cfg.realert_every,
+                Some(last) => self.alerts_sent < cfg.max_alerts && now.saturating_sub(last) >= cfg.realert_every,
             };
 
         if !long_due && !short_due {
@@ -569,4 +569,17 @@ mod tests {
         assert_ne!(p2, p3);
         assert_eq!(p0, p4);
     }
+    #[test]
+    fn a_backwards_clock_step_never_buzzes_or_panics() {
+        let (cfg, mut t) = (Config::default(), Tracker::default());
+        assert_eq!(t.tick(&cfg, 10_000, 0, false, false), None);
+        assert_eq!(t.tick(&cfg, 10_005, 0, false, false), None);
+        // Windows time sync steps the wall clock back past the session start.
+        assert_eq!(t.tick(&cfg, 9_000, 0, false, false), None);
+        assert_eq!(t.tick(&cfg, 9_005, 0, true, false), None);
+        // Same step while locked: the lock timer must not underflow either.
+        assert_eq!(t.tick(&cfg, 8_000, 0, true, false), None);
+        assert_eq!(t.tick(&cfg, 8_005, 0, false, false), None);
+    }
+
 }
