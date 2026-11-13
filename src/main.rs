@@ -228,6 +228,7 @@ struct PairingInfo {
 /// Live timer and sensor status for the desktop window.
 #[derive(Serialize)]
 struct StatusInfo {
+    version: &'static str,
     paused: bool,
     in_meeting: bool,
     autostart: bool,
@@ -307,6 +308,7 @@ fn app_status(state: State<'_, AppState>) -> StatusInfo {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     StatusInfo {
+        version: env!("CARGO_PKG_VERSION"),
         paused: state.paused.load(Ordering::Relaxed),
         in_meeting,
         autostart: autostart_enabled(),

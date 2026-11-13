@@ -20,26 +20,26 @@
         <div>
           <div class="brand-title-row">
             <h1>Desk Pager</h1>
-            <span class="version-pill">v0.5</span>
+            <span id="version-pill" class="version-pill"></span>
           </div>
-          <p class="subtitle">Context-aware posture, eye relief &amp; hydration reminders on your phone</p>
+          <p class="subtitle">Buzzes your phone when it's time to stretch, rest your eyes or take a walk</p>
         </div>
       </div>
 
       <div class="topbar-controls">
         <nav class="tabs" role="tablist" aria-label="Desk Pager views">
-          <button id="tab-btn-schedule" type="button" role="tab" aria-selected="true" class="tab-btn active">Live Workspace</button>
-          <button id="tab-btn-pair" type="button" role="tab" aria-selected="false" class="tab-btn">Phone Pairing</button>
+          <button id="tab-btn-schedule" type="button" role="tab" aria-selected="true" class="tab-btn active">Dashboard</button>
+          <button id="tab-btn-pair" type="button" role="tab" aria-selected="false" class="tab-btn">Pair phone</button>
         </nav>
         <label class="autostart-toggle" title="Show a silent Windows notification in the bottom-right Notification Center alongside your phone alert (turn off for mobile-only)">
           <input id="desktop-notify-check" type="checkbox" checked>
           <span class="switch-track"><span class="switch-thumb"></span></span>
-          <span>Silent PC Alert</span>
+          <span>Also notify on this PC</span>
         </label>
         <label class="autostart-toggle" title="Launch Desk Pager in the system tray when you sign in to Windows">
           <input id="autostart-check" type="checkbox">
           <span class="switch-track"><span class="switch-thumb"></span></span>
-          <span>Auto-start</span>
+          <span>Start with Windows</span>
         </label>
       </div>
     </header>
@@ -63,9 +63,9 @@
         <div class="card-top">
           <span id="state-pill" class="pill pill-active">
             <span class="dot"></span>
-            <span id="state-label">Active · Context-aware</span>
+            <span id="state-label">Tracking your sitting time</span>
           </span>
-          <span id="sensor-meta" class="sensor-meta">Input + Mic sensors online</span>
+          <span id="sensor-meta" class="sensor-meta">Holds buzzes while you're on a call</span>
         </div>
 
         <div class="gauges-grid">
@@ -82,8 +82,8 @@
               </div>
             </div>
             <div class="gauge-caption">
-              <span id="short-tag" class="gauge-tag tag-short">Tier 1 · Quick Stretch</span>
-              <p id="short-Sub" class="gauge-detail">30s pause · spine, eyes &amp; water</p>
+              <span id="short-tag" class="gauge-tag tag-short">Quick stretch</span>
+              <p id="short-Sub" class="gauge-detail">Stretch, rest eyes, drink water</p>
             </div>
           </div>
 
@@ -100,8 +100,8 @@
               </div>
             </div>
             <div class="gauge-caption">
-              <span class="gauge-tag tag-long">Tier 2 · Long Break</span>
-              <p id="long-sub" class="gauge-detail">10 min walk &amp; back recovery</p>
+              <span class="gauge-tag tag-long">Long break</span>
+              <p id="long-sub" class="gauge-detail">10 min walk</p>
             </div>
           </div>
         </div>
@@ -135,12 +135,12 @@
         <div class="controls-stack">
           <div class="action-row">
             <button id="test-buzz" type="button" class="btn btn-primary">Send Test Buzz</button>
-            <button id="mark-stretch" type="button" class="btn btn-secondary" title="Reset only the Quick Stretch timer while keeping the 2-hour Long Break timer counting">Took Stretch</button>
-            <button id="reset-all" type="button" class="btn btn-secondary" title="Reset both Quick Stretch and Long Break timers to 0">Reset 2h Cycle</button>
+            <button id="mark-stretch" type="button" class="btn btn-secondary" title="Reset only the Quick Stretch timer while keeping the 2-hour Long Break timer counting">I stretched</button>
+            <button id="reset-all" type="button" class="btn btn-secondary" title="Reset both Quick Stretch and Long Break timers to 0">Reset timers</button>
           </div>
           <div class="action-row">
-            <button id="toggle-meeting" type="button" class="btn btn-secondary" title="Hold buzzes during a listen-only meeting or screen-share presentation (auto-expires after 90 min)">In a Meeting: Off</button>
-            <button id="toggle-pause" type="button" class="btn btn-secondary">Pause Timer</button>
+            <button id="toggle-meeting" type="button" class="btn btn-secondary" title="Hold buzzes during a listen-only meeting or screen-share presentation (auto-expires after 90 min)">Meeting mode: Off</button>
+            <button id="toggle-pause" type="button" class="btn btn-secondary">Pause reminders</button>
           </div>
         </div>
       </section>
@@ -149,10 +149,10 @@
       <section class="card schedule-card" aria-label="Break schedule customization">
         <div class="card-top">
           <div>
-            <h2>Customize Break Schedule</h2>
-            <p class="card-sub">Type any custom number or click a quick preset below</p>
+            <h2>Break schedule</h2>
+            <p class="card-sub">Type a number or pick a preset. Changes save automatically.</p>
           </div>
-          <span id="save-badge" class="badge-saved" aria-live="polite">Auto-saved</span>
+          <span id="save-badge" class="badge-saved" aria-live="polite">Saved</span>
         </div>
 
         <!-- Tier 1 Config Block -->
@@ -160,8 +160,8 @@
           <div class="studio-tier-header">
             <span class="tier-badge tier-badge-short">1</span>
             <div>
-              <h3>Quick Stretch, Eye Rest &amp; Water</h3>
-              <p class="tier-desc">Pausing keyboard &amp; mouse for the stretch duration after a buzz resets Tier 1 while Tier 2 keeps counting.</p>
+              <h3>Quick stretch, eye rest &amp; water</h3>
+              <p class="tier-desc">A short buzz to stretch, look away from the screen and drink water. The long-break timer keeps counting.</p>
             </div>
           </div>
 
@@ -188,7 +188,7 @@
 
             <div class="field-box">
               <div class="field-head">
-                <label for="short-duration" class="field-label">Stretch pause</label>
+                <label for="short-duration" class="field-label">Stretch length</label>
                 <span class="field-range">5–300 sec</span>
               </div>
               <div class="stepper">
@@ -213,8 +213,8 @@
           <div class="studio-tier-header">
             <span class="tier-badge tier-badge-long">2</span>
             <div>
-              <h3>Long Break (Deep Lower-Back Recovery)</h3>
-              <p class="tier-desc">Stepping away for the walk duration (or locking your PC for 2+ min) resets both timers to 0.</p>
+              <h3>Long break (walk)</h3>
+              <p class="tier-desc">Step away for the walk length, or lock your PC for 2+ minutes, and both timers start again from 0.</p>
             </div>
           </div>
 
@@ -241,7 +241,7 @@
 
             <div class="field-box">
               <div class="field-head">
-                <label for="long-duration" class="field-label">Walk break length</label>
+                <label for="long-duration" class="field-label">Walk length</label>
                 <span class="field-range">1–60 min</span>
               </div>
               <div class="stepper">
@@ -262,7 +262,7 @@
         </div>
 
         <p id="schedule-feedback" class="feedback" role="status" aria-live="polite">
-          Active: Quick stretch every 30m (30s pause) · Long break every 120m (10m walk).
+          
         </p>
       </section>
     </div>
@@ -275,30 +275,30 @@
             <div class="qr-frame">
               <div id="qr" role="img" aria-label="Pairing QR code"></div>
             </div>
-            <span class="badge-secret">128-bit secret topic · DPAPI encrypted</span>
+            <span class="badge-secret">Private code · kept in Windows Credential Manager</span>
           </div>
 
           <div class="pair-info-col">
             <h2>Pair your Android phone</h2>
-            <p class="card-sub">Buzzes are delivered silently through ntfy.sh with zero desktop pop-ups.</p>
+            <p class="card-sub">Buzzes are sent through ntfy.sh, a free notification service. No account needed.</p>
 
             <ol class="steps">
               <li>Open <strong>Desk Pager</strong> on your Android phone.</li>
-              <li>Scan the QR code with your phone camera, or copy and paste the pairing code below, then tap <strong>Pair Phone</strong>.</li>
+              <li>Scan the QR code with your phone camera, or copy and paste the pairing code below, then tap <strong>Pair / Add PC</strong>.</li>
             </ol>
 
-            <label for="code" class="field-label">Secret pairing code</label>
+            <label for="code" class="field-label">Pairing code</label>
             <div class="code-row">
               <input id="code" type="text" readonly spellcheck="false">
               <button id="copy" type="button" class="btn btn-primary">Copy Code</button>
             </div>
 
             <div class="pair-actions">
-              <button id="regenerate" type="button" class="btn btn-secondary">Regenerate Secret Code</button>
+              <button id="regenerate" type="button" class="btn btn-secondary">Get a new code</button>
             </div>
 
             <p id="status" class="feedback" role="status" aria-live="polite"></p>
-            <p class="warn">Anyone with this code can send notifications to your phone. Keep it private, and regenerate it if ever shown on a screen share.</p>
+            <p class="warn">Anyone with this code can send notifications to your phone. Keep it private, and get a new code if it was ever visible on a screen share.</p>
           </div>
         </div>
       </section>

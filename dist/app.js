@@ -37,6 +37,7 @@ const resetAllBtn = document.getElementById("reset-all");
 const testBtn = document.getElementById("test-buzz");
 const regenBtn = document.getElementById("regenerate");
 
+const versionPill = document.getElementById("version-pill");
 const shortEveryInput = document.getElementById("short-every");
 const shortDurationInput = document.getElementById("short-duration");
 const longEveryInput = document.getElementById("long-every");
@@ -80,6 +81,11 @@ function syncPresetChips() {
   }
 }
 
+// One plain sentence describing the schedule that is in force right now.
+function scheduleSummary(s) {
+  return `Now: quick stretch every ${s.short_every_mins} min (${s.short_break_secs} s) · long break every ${s.long_every_mins} min (${s.long_break_mins} min walk).`;
+}
+
 async function loadSettingsIntoForm() {
   const s = await invoke("get_settings");
   shortEveryInput.value = s.short_every_mins;
@@ -88,6 +94,7 @@ async function loadSettingsIntoForm() {
   longDurationInput.value = s.long_break_mins;
   desktopNotifyCheck.checked = Boolean(s.desktop_notify);
   syncPresetChips();
+  showScheduleFeedback(scheduleSummary(s));
 }
 
 // Never rewrite a field under the user's cursor; it is saved again when they commit it.
@@ -114,10 +121,8 @@ async function saveScheduleFromForm() {
   setUnlessFocused(longDurationInput, saved.long_break_mins);
   desktopNotifyCheck.checked = Boolean(saved.desktop_notify);
   syncPresetChips();
-  saveBadgeEl.textContent = "Saved live";
-  showScheduleFeedback(
-    `Active: Quick stretch every ${saved.short_every_mins}m (${saved.short_break_secs}s pause) · Long break every ${saved.long_every_mins}m (${saved.long_break_mins}m walk).`
-  );
+  saveBadgeEl.textContent = "Saved";
+  showScheduleFeedback(scheduleSummary(saved));
   await refreshStatus();
 }
 
@@ -125,6 +130,7 @@ async function refreshStatus() {
   try {
     const s = await invoke("app_status");
     autostartCheck.checked = Boolean(s.autostart);
+    versionPill.textContent = `v${s.version}`;
     desktopNotifyCheck.checked = Boolean(s.desktop_notify);
     if (installBanner) {
       installBanner.hidden = !s.just_installed;
@@ -133,9 +139,9 @@ async function refreshStatus() {
     const shortTargetMin = Math.max(1, Math.round(s.break_after_secs / 60));
     shortTag.textContent =
       s.stretches_completed > 0
-        ? `Tier 1 · Quick Stretch (${s.stretches_completed} done)`
-        : "Tier 1 · Quick Stretch";
-    shortSub.textContent = `${s.short_break_secs}s pause · spine, eyes & water`;
+        ? `Quick stretch (${s.stretches_completed} done)`
+        : "Quick stretch";
+    shortSub.textContent = `${s.short_break_secs} s · stretch, rest eyes, drink water`;
 
     if (s.stretch_pause_rem_secs > 0) {
       const pauseRatio = s.stretch_pause_rem_secs / Math.max(1, s.short_break_secs);
@@ -160,7 +166,7 @@ async function refreshStatus() {
     const shownLongMin = Math.min(s.long_sitting_minutes, longTargetMin);
     const longRatio = Math.min(1, s.long_sitting_secs / Math.max(1, s.long_break_after_secs));
     setRingProgress(longRing, longRatio);
-    longSub.textContent = `${s.long_break_mins} min walk & back recovery`;
+    longSub.textContent = `${s.long_break_mins} min walk`;
     longMeta.textContent = `${shownLongMin} / ${longTargetMin}m`;
     const longRemM = Math.max(0, longTargetMin - shownLongMin);
     if (s.long_sitting_secs >= s.long_break_after_secs && s.idle_secs >= 10) {
@@ -169,18 +175,18 @@ async function refreshStatus() {
       longRem.textContent = longRemM === 0 ? "Long break due!" : `${longRemM}m left`;
     }
 
-    meetingBtn.textContent = s.in_meeting ? "In a Meeting: On" : "In a Meeting: Off";
+    meetingBtn.textContent = s.in_meeting ? "Meeting mode: On" : "Meeting mode: Off";
     meetingBtn.classList.toggle("btn-meeting-on", Boolean(s.in_meeting));
 
     if (s.paused) {
       statePill.className = "pill pill-paused";
       stateLabel.textContent = "Paused";
-      pauseBtn.textContent = "Resume Timer";
+      pauseBtn.textContent = "Resume reminders";
       callNote.hidden = true;
     } else if (s.call_app) {
       statePill.className = "pill pill-hold";
-      stateLabel.textContent = `Hold · ${s.call_app}`;
-      pauseBtn.textContent = "Pause Timer";
+      stateLabel.textContent = `On hold · ${s.call_app}`;
+      pauseBtn.textContent = "Pause reminders";
       callNote.hidden = false;
       callNote.textContent =
         s.call_app === "Meeting mode"
@@ -188,8 +194,8 @@ async function refreshStatus() {
           : `Microphone in use by ${s.call_app} — buzzes are held until 30 s after the call ends.`;
     } else {
       statePill.className = "pill pill-active";
-      stateLabel.textContent = "Active · Context-aware";
-      pauseBtn.textContent = "Pause Timer";
+      stateLabel.textContent = "Tracking your sitting time";
+      pauseBtn.textContent = "Pause reminders";
       callNote.hidden = true;
     }
   } catch (_) {}
@@ -227,16 +233,16 @@ async function render() {
   regenBtn.addEventListener("click", async () => {
     if (!regenConfirmPending) {
       regenConfirmPending = true;
-      regenBtn.textContent = "Click again to confirm new code (unpairs current phone)";
+      regenBtn.textContent = "Click again to confirm (your phone must pair again)";
       showPairFeedback("Confirming will generate a new 128-bit secret topic.");
       setTimeout(() => {
         regenConfirmPending = false;
-        regenBtn.textContent = "Regenerate Secret Code";
+        regenBtn.textContent = "Get a new code";
       }, 5000);
       return;
     }
     regenConfirmPending = false;
-    regenBtn.textContent = "Regenerate Secret Code";
+    regenBtn.textContent = "Get a new code";
     const updated = await invoke("regenerate_pairing");
     document.getElementById("qr").innerHTML = updated.qr_svg;
     document.getElementById("code").value = updated.code;
@@ -249,11 +255,11 @@ async function render() {
       desktopNotifyCheck.checked = Boolean(enabled);
       showScheduleFeedback(
         enabled
-          ? "Silent PC notifications enabled (shows in Windows Notification Center alongside phone buzz)."
-          : "Silent PC notifications disabled (mobile-only mode)."
+          ? "This PC will also show a quiet notification with each phone buzz."
+          : "Buzzes go to your phone only."
       );
     } catch (err) {
-      showScheduleFeedback("Could not update PC notification preference: " + err);
+      showScheduleFeedback("Could not change the PC notification setting: " + err);
     }
   });
 
@@ -274,13 +280,13 @@ async function render() {
 
   stretchBtn.addEventListener("click", async () => {
     await invoke("mark_quick_stretch");
-    showScheduleFeedback("Quick stretch reset to 0 — Long Break timer continues.");
+    showScheduleFeedback("Quick-stretch timer restarted. The long-break timer keeps counting.");
     await refreshStatus();
   });
 
   resetAllBtn.addEventListener("click", async () => {
     await invoke("reset_all_timers");
-    showScheduleFeedback("Both Quick Stretch and Long Break timers reset to 0.");
+    showScheduleFeedback("Both timers restarted from 0.");
     await refreshStatus();
   });
 
