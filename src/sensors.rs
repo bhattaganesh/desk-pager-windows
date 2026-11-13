@@ -10,8 +10,9 @@ use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
         Media::Audio::{
-            eCapture, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
-            IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+            eCapture, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionEnumerator,
+            IAudioSessionManager2, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
+            DEVICE_STATE_ACTIVE,
         },
         System::{
             Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED},
@@ -83,30 +84,86 @@ pub fn idle_secs() -> Result<u64> {
     }
 }
 
-/// Executable names owning an Active audio session on any active microphone capture endpoint.
-pub fn capture_apps() -> Result<Vec<String>> {
+/// Result of one microphone capture scan: the apps found, plus the first error if anything was skipped.
+#[derive(Default)]
+pub struct CaptureScan {
+    /// Executable names owning an Active audio session on any active microphone capture endpoint.
+    pub apps: Vec<String>,
+    /// First failure met while scanning; `apps` still holds everything that could be read.
+    pub first_error: Option<Error>,
+}
+
+impl CaptureScan {
+    /// Remembers the first failure of this scan.
+    fn note(&mut self, error: Error) {
+        self.first_error.get_or_insert(error);
+    }
+}
+
+/// Scans every active microphone capture endpoint, skipping any endpoint or session that fails.
+pub fn capture_apps() -> CaptureScan {
+    let mut scan = CaptureScan::default();
+    if let Err(e) = scan_endpoints(&mut scan) {
+        scan.note(e);
+    }
+    scan.apps.sort();
+    scan.apps.dedup();
+    scan
+}
+
+/// Walks all capture endpoints into `scan`; returns `Err` only when the endpoint list itself is unavailable.
+fn scan_endpoints(scan: &mut CaptureScan) -> Result<()> {
     COM_INIT.with(|init| init.clone())?;
-    let mut active = Vec::new();
     // SAFETY: COM is initialised for this thread; every interface lives within its local scope.
     unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let devices = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
         for d in 0..devices.GetCount()? {
-            let manager: IAudioSessionManager2 = devices.Item(d)?.Activate(CLSCTX_ALL, None)?;
-            let sessions = manager.GetSessionEnumerator()?;
-            for s in 0..sessions.GetCount()? {
-                let control = sessions.GetSession(s)?;
-                if control.GetState()? != AudioSessionStateActive {
+            let sessions = match endpoint_sessions(&devices, d) {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    scan.note(e);
                     continue;
                 }
-                let pid = control.cast::<IAudioSessionControl2>()?.GetProcessId()?;
-                active.push(process_name(pid));
+            };
+            let count = match sessions.GetCount() {
+                Ok(count) => count,
+                Err(e) => {
+                    scan.note(e);
+                    continue;
+                }
+            };
+            for s in 0..count {
+                match active_session_pid(&sessions, s) {
+                    Ok(Some(pid)) => scan.apps.push(process_name(pid)),
+                    Ok(None) => {}
+                    Err(e) => scan.note(e),
+                }
             }
         }
     }
-    active.sort();
-    active.dedup();
-    Ok(active)
+    Ok(())
+}
+
+/// Opens the audio session list of capture endpoint `d`.
+///
+/// # Safety
+/// COM must be initialised on the calling thread.
+unsafe fn endpoint_sessions(devices: &IMMDeviceCollection, d: u32) -> Result<IAudioSessionEnumerator> {
+    let manager: IAudioSessionManager2 = devices.Item(d)?.Activate(CLSCTX_ALL, None)?;
+    manager.GetSessionEnumerator()
+}
+
+/// Returns the owning process id of session `s` when that session is Active.
+///
+/// # Safety
+/// COM must be initialised on the calling thread.
+unsafe fn active_session_pid(sessions: &IAudioSessionEnumerator, s: i32) -> Result<Option<u32>> {
+    let control = sessions.GetSession(s)?;
+    if control.GetState()? != AudioSessionStateActive {
+        return Ok(None);
+    }
+    Ok(Some(control.cast::<IAudioSessionControl2>()?.GetProcessId()?))
 }
 
 fn process_name(pid: u32) -> String {

@@ -43,7 +43,6 @@ const longEveryInput = document.getElementById("long-every");
 const longDurationInput = document.getElementById("long-duration");
 
 let regenConfirmPending = false;
-let saveDebounce = null;
 
 function switchTab(tab) {
   const isSchedule = tab === "schedule";
@@ -91,6 +90,11 @@ async function loadSettingsIntoForm() {
   syncPresetChips();
 }
 
+// Never rewrite a field under the user's cursor; it is saved again when they commit it.
+function setUnlessFocused(input, value) {
+  if (document.activeElement !== input) input.value = value;
+}
+
 async function saveScheduleFromForm() {
   const shortEveryMins = Math.max(1, Math.round(Number(shortEveryInput.value) || 30));
   const shortBreakSecs = Math.max(5, Math.round(Number(shortDurationInput.value) || 30));
@@ -104,10 +108,10 @@ async function saveScheduleFromForm() {
     longBreakMins,
     desktopNotify: desktopNotifyCheck.checked,
   });
-  shortEveryInput.value = saved.short_every_mins;
-  shortDurationInput.value = saved.short_break_secs;
-  longEveryInput.value = saved.long_every_mins;
-  longDurationInput.value = saved.long_break_mins;
+  setUnlessFocused(shortEveryInput, saved.short_every_mins);
+  setUnlessFocused(shortDurationInput, saved.short_break_secs);
+  setUnlessFocused(longEveryInput, saved.long_every_mins);
+  setUnlessFocused(longDurationInput, saved.long_break_mins);
   desktopNotifyCheck.checked = Boolean(saved.desktop_notify);
   syncPresetChips();
   saveBadgeEl.textContent = "Saved live";
@@ -115,14 +119,6 @@ async function saveScheduleFromForm() {
     `Active: Quick stretch every ${saved.short_every_mins}m (${saved.short_break_secs}s pause) · Long break every ${saved.long_every_mins}m (${saved.long_break_mins}m walk).`
   );
   await refreshStatus();
-}
-
-function scheduleAutoSave() {
-  syncPresetChips();
-  if (saveDebounce) clearTimeout(saveDebounce);
-  saveDebounce = setTimeout(() => {
-    saveScheduleFromForm().catch((err) => showScheduleFeedback("Save failed: " + err));
-  }, 350);
 }
 
 async function refreshStatus() {
@@ -326,9 +322,9 @@ async function render() {
   }
 
   for (const input of [shortEveryInput, shortDurationInput, longEveryInput, longDurationInput]) {
-    input.addEventListener("input", scheduleAutoSave);
+    input.addEventListener("input", syncPresetChips);
+    // Save only on commit (blur or Enter), never on each keystroke of a half-typed number.
     input.addEventListener("change", () => {
-      if (saveDebounce) clearTimeout(saveDebounce);
       saveScheduleFromForm().catch((err) => showScheduleFeedback("Save failed: " + err));
     });
   }

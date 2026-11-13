@@ -6,14 +6,17 @@ mod secret;
 mod sensors;
 
 use std::{
+    collections::VecDeque,
+    ffi::OsStr,
     fs::OpenOptions,
     io::Write,
     os::windows::process::CommandExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+        Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -46,6 +49,14 @@ const POLL: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const SEND_ATTEMPTS: u32 = 3;
 const SEND_RETRY_WAIT: Duration = Duration::from_secs(5);
+const MAX_PENDING_SENDS: usize = 8;
+const APP_DIR: &str = "DeskPager";
+const SHORTCUT_NAME: &str = "Desk Pager.lnk";
+const SYSTEM_DIR: &str = "System32";
+const TASKKILL_EXE: &str = "taskkill.exe";
+const CMD_EXE: &str = "cmd.exe";
+const PING_EXE: &str = "ping.exe";
+const POWERSHELL_EXE: &str = r"WindowsPowerShell\v1.0\powershell.exe";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "DeskPager";
 const LOG_FILE: &str = "desk-pager.log";
@@ -187,7 +198,7 @@ struct AppState {
     quitting: AtomicBool,
     paused: AtomicBool,
     meeting_until: AtomicU64,
-    sending: Arc<AtomicBool>,
+    outbox: Sender<Outgoing>,
     phone_alarm_active: AtomicBool,
     idle_secs: AtomicU64,
     sitting_secs: AtomicU64,
@@ -399,7 +410,7 @@ fn mark_quick_stretch(app: AppHandle, state: State<'_, AppState>) {
         state.stretches_completed.store(0, Ordering::Relaxed);
     }
     if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
-        spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
+        enqueue_buzz(&app, CLEAR_TITLE, "Break started at PC".into());
     }
     state.stretch_pause_rem_secs.store(0, Ordering::Relaxed);
 }
@@ -413,7 +424,7 @@ fn reset_all_timers(app: AppHandle, state: State<'_, AppState>) {
     state.stretch_pause_rem_secs.store(0, Ordering::Relaxed);
     state.stretches_completed.store(0, Ordering::Relaxed);
     if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
-        spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
+        enqueue_buzz(&app, CLEAR_TITLE, "Break started at PC".into());
     }
 }
 
@@ -453,7 +464,7 @@ fn toggle_pause(app: AppHandle, state: State<'_, AppState>) -> bool {
         state.sitting_secs.store(0, Ordering::Relaxed);
         state.long_sitting_secs.store(0, Ordering::Relaxed);
         if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
-            spawn_deliver(&app, CLEAR_TITLE, "Break started at PC".into());
+            enqueue_buzz(&app, CLEAR_TITLE, "Break started at PC".into());
         }
     }
     if let Ok(guard) = state.pause_item.lock() {
@@ -468,7 +479,7 @@ fn toggle_pause(app: AppHandle, state: State<'_, AppState>) -> bool {
 #[tauri::command]
 fn send_test_buzz(app: AppHandle) {
     maybe_notify_desktop(&app, "Desk Pager test", "Silent PC notification + phone test buzz active.");
-    spawn_deliver(&app, "Desk Pager test", "Test buzz from your laptop.".into());
+    enqueue_buzz(&app, "Desk Pager test", "Test buzz from your laptop.".into());
 }
 
 /// Called by the pairing page once it has drawn itself, so a blank window shows up in the log.
@@ -480,7 +491,7 @@ fn pairing_rendered(qr_shown: bool) {
 /// Loads saved schedule settings from `%LOCALAPPDATA%\DeskPager\settings.cfg`, or defaults.
 fn load_settings() -> ScheduleSettings {
     std::env::var_os("LOCALAPPDATA")
-        .map(|dir| PathBuf::from(dir).join("DeskPager").join(SETTINGS_FILE))
+        .map(|dir| PathBuf::from(dir).join(APP_DIR).join(SETTINGS_FILE))
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|raw| ScheduleSettings::from_cfg_text(&raw))
         .unwrap_or_default()
@@ -489,7 +500,7 @@ fn load_settings() -> ScheduleSettings {
 /// Writes schedule settings to `%LOCALAPPDATA%\DeskPager\settings.cfg` (never contains the secret topic).
 fn persist_settings(settings: ScheduleSettings) -> Result<(), String> {
     let base = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA not set")?;
-    let dir = PathBuf::from(base).join("DeskPager");
+    let dir = PathBuf::from(base).join(APP_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(dir.join(SETTINGS_FILE), settings.to_cfg_text()).map_err(|e| e.to_string())
 }
@@ -516,16 +527,18 @@ fn parse_break_after_secs(args: &[String]) -> Result<Option<u64>, String> {
 }
 
 fn main() {
+    // With panic = "abort" and no console, a panic (Tauri panics on a setup error) would otherwise leave no trace.
+    std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == UNINSTALL_ARG) {
         uninstall_desk_pager();
         return;
     }
-    if should_self_install(&args) {
-        if let Err(e) = self_install_and_relaunch(&args) {
-            log(&format!("self-install failed (running in place): {e}"));
-        } else {
-            return;
+    let action = plan_install(&args);
+    if action != InstallAction::RunInPlace {
+        match self_install_and_relaunch(&args, action) {
+            Ok(()) => return,
+            Err(e) => log(&format!("self-install failed (running in place): {e}")),
         }
     }
     let break_override = match parse_break_after_secs(&args) {
@@ -554,7 +567,8 @@ fn main() {
     let is_autostart = args.iter().any(|a| a == AUTOSTART_ARG);
     let settings = load_settings();
     let cfg = settings.to_config(break_override);
-    let app = tauri::Builder::default()
+    let (outbox, outbox_rx) = mpsc::channel();
+    let built = tauri::Builder::default()
         .manage(AppState {
             topic: Mutex::new(topic.value),
             first_run,
@@ -562,7 +576,7 @@ fn main() {
             quitting: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             meeting_until: AtomicU64::new(0),
-            sending: Arc::new(AtomicBool::new(false)),
+            outbox,
             phone_alarm_active: AtomicBool::new(false),
             idle_secs: AtomicU64::new(0),
             sitting_secs: AtomicU64::new(0),
@@ -667,7 +681,7 @@ fn main() {
                     MENU_PAIR => open_pairing(app),
                     MENU_TEST => {
                         maybe_notify_desktop(app, "Desk Pager test", "Silent PC notification + phone test buzz active.");
-                        spawn_deliver(app, "Desk Pager test", "Test buzz from your laptop.".into());
+                        enqueue_buzz(app, "Desk Pager test", "Test buzz from your laptop.".into());
                     }
                     MENU_MEETING => {
                         let _ = toggle_meeting(app.state::<AppState>());
@@ -682,7 +696,9 @@ fn main() {
                     }
                     MENU_AUTOSTART => {
                         let enable = !autostart_enabled();
-                        let _ = set_autostart_cmd(app.state::<AppState>(), enable);
+                        if let Err(e) = set_autostart_cmd(app.state::<AppState>(), enable) {
+                            log(&format!("start with Windows change failed: {e}"));
+                        }
                     }
                     MENU_QUIT => {
                         app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
@@ -694,6 +710,8 @@ fn main() {
 
             let handle = app.handle().clone();
             std::thread::spawn(move || run_timer(&handle, &status, &tray));
+            let sender_handle = app.handle().clone();
+            std::thread::spawn(move || run_sender(outbox_rx, |msg| deliver(&sender_handle, msg)));
             spawn_show_window_listener(app.handle().clone());
 
             if just_installed {
@@ -711,7 +729,7 @@ fn main() {
                     "Desk Pager test",
                     "Silent PC notification + phone test buzz active.",
                 );
-                spawn_deliver(app.handle(), "Desk Pager test", "Test buzz from your laptop.".into());
+                enqueue_buzz(app.handle(), "Desk Pager test", "Test buzz from your laptop.".into());
             }
             log(&format!(
                 "started, first run: {first_run}, just_installed: {just_installed}, break_after: {}s, long_break_after: {}s, desktop_notify: {}",
@@ -719,8 +737,14 @@ fn main() {
             ));
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("failed to build tauri app");
+        .build(tauri::generate_context!());
+    let app = match built {
+        Ok(app) => app,
+        Err(e) => {
+            log(&format!("failed to build tauri app: {e}"));
+            std::process::exit(1);
+        }
+    };
 
     app.run(|app_handle, event| {
         // Closing the dashboard destroys it (freeing WebView2); the tray app lives on until MENU_QUIT.
@@ -738,6 +762,7 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
     let mut suspends_seen = sensors::suspend_count();
     let mut shown = String::new();
     let mut first_tick = true;
+    let mut capture_failing = false;
     loop {
         let now = unix_secs();
         let state = app.state::<AppState>();
@@ -763,14 +788,14 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                 tracker.reset();
                 state.meeting_until.store(0, Ordering::Relaxed);
                 if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
-                    spawn_deliver(app, CLEAR_TITLE, "Break started at PC".into());
+                    enqueue_buzz(app, CLEAR_TITLE, "Break started at PC".into());
                 }
             }
             let locked = sensors::is_locked();
             if locked {
                 state.meeting_until.store(0, Ordering::Relaxed);
                 if state.phone_alarm_active.swap(false, Ordering::Relaxed) {
-                    spawn_deliver(app, CLEAR_TITLE, "Break started at PC".into());
+                    enqueue_buzz(app, CLEAR_TITLE, "Break started at PC".into());
                 }
             }
             match sensors::idle_secs() {
@@ -779,10 +804,15 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                     if idle >= cfg.short_break_secs.min(30)
                         && state.phone_alarm_active.swap(false, Ordering::Relaxed)
                     {
-                        spawn_deliver(app, CLEAR_TITLE, "Break started at PC".into());
+                        enqueue_buzz(app, CLEAR_TITLE, "Break started at PC".into());
                     }
-                    let apps = sensors::capture_apps().unwrap_or_default();
-                    let mic_app = core::active_call_app(&apps).map(str::to_string);
+                    let scan = sensors::capture_apps();
+                    let capture_error = scan.first_error.as_ref().map(ToString::to_string);
+                    if let Some(line) = capture_transition(capture_failing, capture_error.as_deref()) {
+                        log(&line);
+                    }
+                    capture_failing = capture_error.is_some();
+                    let mic_app = core::active_call_app(&scan.apps).map(str::to_string);
                     let in_meeting = state.meeting_until.load(Ordering::Relaxed) > now;
                     let hold_label = mic_app.clone().or_else(|| in_meeting.then(|| "Meeting mode".to_string()));
                     if let Ok(mut guard) = state.call_app.lock() {
@@ -797,7 +827,7 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                                     cfg.short_break_secs,
                                 );
                                 maybe_notify_desktop(app, "Quick stretch & eye rest", &body);
-                                spawn_deliver(app, "Quick stretch & eye rest", body);
+                                enqueue_buzz(app, "Quick stretch & eye rest", body);
                             }
                             core::AlertKind::LongBreak => {
                                 let body = format!(
@@ -808,7 +838,7 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
                                 );
                                 state.phone_alarm_active.store(true, Ordering::Relaxed);
                                 maybe_notify_desktop(app, "Time for a long break", &body);
-                                spawn_deliver(app, "Time for a long break", body);
+                                enqueue_buzz(app, "Time for a long break", body);
                             }
                         }
                     }
@@ -844,6 +874,18 @@ fn run_timer(app: &AppHandle, status: &MenuItem<tauri::Wry>, tray: &TrayIcon) {
         }
         first_tick = false;
         std::thread::sleep(POLL);
+    }
+}
+
+/// Returns the line to log when call detection starts failing or recovers, `None` while its state is unchanged.
+///
+/// * `was_failing` - Whether the previous scan reported an error.
+/// * `error` - This scan's error text, if any.
+fn capture_transition(was_failing: bool, error: Option<&str>) -> Option<String> {
+    match (was_failing, error) {
+        (false, Some(e)) => Some(format!("call detection failing (some microphone sessions unreadable): {e}")),
+        (true, None) => Some("call detection recovered".to_string()),
+        _ => None,
     }
 }
 
@@ -894,43 +936,76 @@ fn show_silent_desktop_notification(title: &str, body: &str) -> Result<(), Strin
     notifier.Show(&toast).map_err(|e| e.to_string())
 }
 
-/// Runs `work` on a background thread unless another send is already in flight.
-fn spawn_single_flight<F>(in_flight: &Arc<AtomicBool>, work: F) -> bool
-where
-    F: FnOnce() + Send + 'static,
-{
-    if in_flight.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        return false;
-    }
-    let flag = Arc::clone(in_flight);
-    std::thread::spawn(move || {
-        struct Guard(Arc<AtomicBool>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _guard = Guard(flag);
-        work();
-    });
-    true
+/// One phone message waiting for the sender thread.
+#[derive(Debug, PartialEq, Eq)]
+struct Outgoing {
+    title: &'static str,
+    body: String,
 }
 
-/// Spawns a non-overlapping background thread to deliver one buzz, so the timer thread never blocks.
-fn spawn_deliver(app: &AppHandle, title: &'static str, body: String) {
-    let state = app.state::<AppState>();
-    let Ok(guard) = state.topic.lock() else { return };
-    let topic = guard.clone();
-    drop(guard);
-    if !spawn_single_flight(&state.sending, move || deliver(&topic, title, body)) {
-        log(&format!("buzz skipped (send already in progress): {title}"));
+/// Pending phone messages in send order, capped so a long outage cannot pile up stale buzzes.
+#[derive(Default)]
+struct SendQueue {
+    pending: VecDeque<Outgoing>,
+}
+
+impl SendQueue {
+    /// Appends `msg`; past `MAX_PENDING_SENDS` it returns the oldest pending non-clear message, dropped to make room.
+    fn push(&mut self, msg: Outgoing) -> Option<Outgoing> {
+        self.pending.push_back(msg);
+        if self.pending.len() <= MAX_PENDING_SENDS {
+            return None;
+        }
+        // A clear is never dropped: losing one can leave the phone alarm ringing.
+        let oldest_buzz = self.pending.iter().position(|m| m.title != CLEAR_TITLE)?;
+        self.pending.remove(oldest_buzz)
+    }
+
+    /// Takes the next message to send, oldest first.
+    fn pop(&mut self) -> Option<Outgoing> {
+        self.pending.pop_front()
+    }
+}
+
+/// Body of the one sender thread: hands messages to `send` in order until every `Sender` is gone.
+///
+/// * `rx` - Receiving end of the channel held in `AppState::outbox`.
+/// * `send` - Blocking delivery of one message.
+fn run_sender(rx: Receiver<Outgoing>, mut send: impl FnMut(Outgoing)) {
+    let mut queue = SendQueue::default();
+    loop {
+        let next = match queue.pop() {
+            Some(msg) => msg,
+            None => match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => return,
+            },
+        };
+        send(next);
+        while let Ok(msg) = rx.try_recv() {
+            if let Some(dropped) = queue.push(msg) {
+                log(&format!("buzz dropped (more than {MAX_PENDING_SENDS} waiting): {}", dropped.title));
+            }
+        }
+    }
+}
+
+/// Queues one buzz for the sender thread and returns at once, so the caller never waits on the network.
+fn enqueue_buzz(app: &AppHandle, title: &'static str, body: String) {
+    if app.state::<AppState>().outbox.send(Outgoing { title, body }).is_err() {
+        log(&format!("buzz not queued (sender thread stopped): {title}"));
     }
 }
 
 /// Sends one buzz to the phone, retrying a few times, and logs the outcome (never the topic).
-fn deliver(topic: &str, title: &str, body: String) {
+fn deliver(app: &AppHandle, msg: Outgoing) {
+    let Outgoing { title, body } = msg;
+    let topic = match app.state::<AppState>().topic.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => return log(&format!("buzz not sent (topic lock poisoned): {title}")),
+    };
     for attempt in 1..=SEND_ATTEMPTS {
-        match tauri::async_runtime::block_on(send(topic, title, body.clone())) {
+        match tauri::async_runtime::block_on(send(&topic, title, body.clone())) {
             Ok(()) => return log(&format!("buzz sent: {title}")),
             Err(e) => log(&format!("buzz failed (attempt {attempt}/{SEND_ATTEMPTS}): {e}")),
         }
@@ -984,54 +1059,114 @@ fn open_pairing(app: &AppHandle) {
 /// Returns the canonical per-user installation path (`%LOCALAPPDATA%\Programs\DeskPager\desk-pager.exe`).
 fn canonical_install_exe() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
-        .map(|dir| PathBuf::from(dir).join("Programs").join("DeskPager").join("desk-pager.exe"))
+        .map(|dir| PathBuf::from(dir).join("Programs").join(APP_DIR).join("desk-pager.exe"))
 }
 
-/// Returns true when the current executable should install itself into `%LOCALAPPDATA%\Programs\DeskPager`.
-fn should_self_install(args: &[String]) -> bool {
-    if args.iter().any(|a| a == NO_INSTALL_ARG || a == JUST_INSTALLED_ARG || a == UNINSTALL_ARG) {
-        return false;
+/// What a launch from outside the install folder should do about installation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallAction {
+    /// Leave the installation alone and run this executable where it is.
+    RunInPlace,
+    /// The installed copy is this same binary: start (or show) it and exit.
+    ShowInstalled,
+    /// Replace the installed binary, keeping the user's autostart and shortcut choices.
+    Upgrade,
+    /// Copy the binary, create shortcuts and enable Start with Windows.
+    FirstInstall,
+}
+
+/// Decides the install action from already-gathered facts.
+///
+/// * `installed_exists` - An exe already sits at the canonical install path.
+/// * `identical` - That exe is byte-identical to the running one.
+/// * `explicit` - `--install` was passed.
+/// * `from_cargo_target` - Running from a Cargo `target\debug` or `target\release` tree.
+fn install_action(installed_exists: bool, identical: bool, explicit: bool, from_cargo_target: bool) -> InstallAction {
+    if explicit {
+        InstallAction::FirstInstall
+    } else if from_cargo_target {
+        InstallAction::RunInPlace
+    } else if !installed_exists {
+        InstallAction::FirstInstall
+    } else if identical {
+        InstallAction::ShowInstalled
+    } else {
+        InstallAction::Upgrade
     }
-    let Some(target) = canonical_install_exe() else {
-        return false;
-    };
-    let Ok(current) = std::env::current_exe() else {
-        return false;
+}
+
+/// Gathers the facts for `install_action` from the arguments, the running exe and the installed copy.
+fn plan_install(args: &[String]) -> InstallAction {
+    if args.iter().any(|a| a == NO_INSTALL_ARG || a == JUST_INSTALLED_ARG || a == UNINSTALL_ARG) {
+        return InstallAction::RunInPlace;
+    }
+    let (Some(target), Ok(current)) = (canonical_install_exe(), std::env::current_exe()) else {
+        return InstallAction::RunInPlace;
     };
     let cur_norm = current.to_string_lossy().to_ascii_lowercase();
-    let tgt_norm = target.to_string_lossy().to_ascii_lowercase();
-    if cur_norm == tgt_norm {
-        return false;
+    if cur_norm == target.to_string_lossy().to_ascii_lowercase() {
+        return InstallAction::RunInPlace;
     }
-    if args.iter().any(|a| a == INSTALL_ARG) {
-        return true;
-    }
-    // Skip automatic self-install when running directly from a Cargo build tree (`target\debug` or `target\release`).
-    !(cur_norm.contains("\\target\\debug\\") || cur_norm.contains("\\target\\release\\"))
+    let installed_exists = target.exists();
+    let identical = installed_exists
+        && files_identical(&current, &target).unwrap_or_else(|e| {
+            log(&format!("cannot compare with the installed copy (treating it as different): {e}"));
+            false
+        });
+    let explicit = args.iter().any(|a| a == INSTALL_ARG);
+    let from_cargo_target = cur_norm.contains("\\target\\debug\\") || cur_norm.contains("\\target\\release\\");
+    install_action(installed_exists, identical, explicit, from_cargo_target)
 }
 
-/// Copies the current binary to `%LOCALAPPDATA%\Programs\DeskPager\desk-pager.exe`, creates Start Menu & Desktop shortcuts,
-/// registers Windows Installed Apps, enables Start with Windows, and launches the installed copy with `--just-installed`.
-fn self_install_and_relaunch(args: &[String]) -> Result<(), String> {
+/// Whether two files hold the same bytes (length is compared first, contents only when it matches).
+fn files_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    Ok(std::fs::read(a)? == std::fs::read(b)?)
+}
+
+/// Returns `%SystemRoot%\System32`, so helper programs are never resolved by bare name.
+fn system_dir() -> Result<PathBuf, String> {
+    system_dir_from(std::env::var_os("SystemRoot").as_deref())
+}
+
+/// Builds the system directory from a `SystemRoot` value, refusing a missing or relative one.
+fn system_dir_from(system_root: Option<&OsStr>) -> Result<PathBuf, String> {
+    let root = Path::new(system_root.ok_or("SystemRoot is not set")?);
+    if !root.is_absolute() {
+        return Err("SystemRoot is not an absolute path".to_string());
+    }
+    Ok(root.join(SYSTEM_DIR))
+}
+
+/// Logs a failed install or uninstall step and remembers its name for the final summary line.
+fn record_step(failed: &mut Vec<&'static str>, name: &'static str, result: Result<(), String>) {
+    if let Err(e) = result {
+        log(&format!("step failed: {name}: {e}"));
+        failed.push(name);
+    }
+}
+
+/// Force-stops every other running `desk-pager.exe` so its binary can be replaced or removed.
+fn kill_other_instances(system_dir: &Path) -> Result<(), String> {
+    let my_pid = std::process::id();
+    // taskkill's exit code is ignored: it is non-zero whenever no other copy was running.
+    Command::new(system_dir.join(TASKKILL_EXE))
+        .args(["/F", "/IM", "desk-pager.exe", "/FI", &format!("PID ne {my_pid}")])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|_| ())
+        .map_err(|e| format!("cannot run taskkill: {e}"))
+}
+
+/// Carries out `action`: starts the identical installed copy, or copies this binary to
+/// `%LOCALAPPDATA%\Programs\DeskPager\desk-pager.exe` and relaunches it. Only a first install creates
+/// shortcuts and enables Start with Windows; an upgrade leaves both as the user set them.
+fn self_install_and_relaunch(args: &[String], action: InstallAction) -> Result<(), String> {
     let target = canonical_install_exe().ok_or("LOCALAPPDATA not set")?;
     let install_dir = target.parent().ok_or("invalid install directory")?;
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
-
-    // Stop any running older instance so the target binary can be overwritten cleanly.
-    let my_pid = std::process::id();
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "desk-pager.exe", "/FI", &format!("PID ne {my_pid}")])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    std::thread::sleep(Duration::from_millis(350));
-
-    std::fs::create_dir_all(install_dir).map_err(|e| format!("create install dir failed: {e}"))?;
-    std::fs::copy(&current, &target).map_err(|e| format!("copy binary failed: {e}"))?;
-
-    register_uninstaller(&target, install_dir);
-    create_shortcuts(&target);
-    let _ = set_autostart(true);
-
     let mut launch_args: Vec<String> = args
         .iter()
         .skip(1)
@@ -1039,92 +1174,186 @@ fn self_install_and_relaunch(args: &[String]) -> Result<(), String> {
         .cloned()
         .collect();
     launch_args.push(OPEN_PAIR_ARG.to_string());
-    launch_args.push(JUST_INSTALLED_ARG.to_string());
 
+    if action == InstallAction::ShowInstalled {
+        Command::new(&target)
+            .args(&launch_args)
+            .spawn()
+            .map_err(|e| format!("starting the installed copy failed: {e}"))?;
+        log("installed copy is identical to this one; started it without reinstalling");
+        return Ok(());
+    }
+
+    let first_install = action == InstallAction::FirstInstall;
+    let system_dir = system_dir()?;
+    let mut failed = Vec::new();
+
+    record_step(&mut failed, "stop running copy", kill_other_instances(&system_dir));
+    std::thread::sleep(Duration::from_millis(350));
+
+    std::fs::create_dir_all(install_dir).map_err(|e| format!("create install dir failed: {e}"))?;
+    std::fs::copy(&current, &target).map_err(|e| format!("copy binary failed: {e}"))?;
+
+    record_step(&mut failed, "uninstall registry entry", register_uninstaller(&target, install_dir));
+    if first_install {
+        for (name, path) in shortcut_paths() {
+            let created = path.and_then(|lnk| create_windows_shortcut(&system_dir, &target, &lnk));
+            record_step(&mut failed, name, created);
+        }
+        record_step(&mut failed, "start with Windows", set_autostart(true));
+        launch_args.push(JUST_INSTALLED_ARG.to_string());
+    }
+
+    let verb = if first_install { "installed" } else { "upgraded" };
+    let outcome = if failed.is_empty() {
+        "all steps ok".to_string()
+    } else {
+        format!("failed steps: {}", failed.join(", "))
+    };
     Command::new(&target)
         .args(&launch_args)
         .spawn()
-        .map_err(|e| format!("relaunch installed binary failed: {e}"))?;
-    log(&format!("installed Desk Pager to {}", target.display()));
+        .map_err(|e| format!("{verb} to {} ({outcome}) but relaunching it failed: {e}", target.display()))?;
+    log(&format!("{verb} Desk Pager to {} ({outcome})", target.display()));
     Ok(())
 }
 
 /// Registers Desk Pager under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskPager`.
-fn register_uninstaller(target_exe: &Path, install_dir: &Path) {
-    if let Ok(key) = windows_registry::CURRENT_USER.create(UNINSTALL_KEY) {
-        let exe_str = target_exe.display().to_string();
-        let _ = key.set_string("DisplayName", "Desk Pager");
-        let _ = key.set_string("DisplayVersion", env!("CARGO_PKG_VERSION"));
-        let _ = key.set_string("Publisher", "Desk Pager");
-        let _ = key.set_string("DisplayIcon", &exe_str);
-        let _ = key.set_string("InstallLocation", install_dir.display().to_string());
-        let _ = key.set_string("UninstallString", format!("\"{exe_str}\" {UNINSTALL_ARG}"));
-        let _ = key.set_u32("NoModify", 1);
-        let _ = key.set_u32("NoRepair", 1);
-    }
+fn register_uninstaller(target_exe: &Path, install_dir: &Path) -> Result<(), String> {
+    let exe_str = target_exe.display().to_string();
+    let write = || -> windows_registry::Result<()> {
+        let key = windows_registry::CURRENT_USER.create(UNINSTALL_KEY)?;
+        key.set_string("DisplayName", "Desk Pager")?;
+        key.set_string("DisplayVersion", env!("CARGO_PKG_VERSION"))?;
+        key.set_string("Publisher", "Desk Pager")?;
+        key.set_string("DisplayIcon", &exe_str)?;
+        key.set_string("InstallLocation", install_dir.display().to_string())?;
+        key.set_string("UninstallString", format!("\"{exe_str}\" {UNINSTALL_ARG}"))?;
+        key.set_u32("NoModify", 1)?;
+        key.set_u32("NoRepair", 1)
+    };
+    write().map_err(|e| e.to_string())
 }
 
-/// Creates Start Menu and Desktop `.lnk` shortcuts pointing to the installed `desk-pager.exe`.
-fn create_shortcuts(target_exe: &Path) {
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let start_menu_lnk = PathBuf::from(appdata)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Desk Pager.lnk");
-        create_windows_shortcut(target_exe, &start_menu_lnk);
-    }
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        let desktop_lnk = PathBuf::from(profile).join("Desktop").join("Desk Pager.lnk");
-        create_windows_shortcut(target_exe, &desktop_lnk);
-    }
+/// Start Menu and Desktop shortcut locations, each `Err` when its base folder variable is unset.
+fn shortcut_paths() -> [(&'static str, Result<PathBuf, String>); 2] {
+    let base = |var: &str| std::env::var_os(var).map(PathBuf::from).ok_or(format!("{var} not set"));
+    [
+        (
+            "Start Menu shortcut",
+            base("APPDATA").map(|dir| {
+                dir.join("Microsoft").join("Windows").join("Start Menu").join("Programs").join(SHORTCUT_NAME)
+            }),
+        ),
+        ("Desktop shortcut", base("USERPROFILE").map(|dir| dir.join("Desktop").join(SHORTCUT_NAME))),
+    ]
 }
 
 /// Uses `WScript.Shell` via PowerShell to write a standard Windows `.lnk` shortcut without extra crates.
-fn create_windows_shortcut(target_exe: &Path, shortcut_path: &Path) {
+fn create_windows_shortcut(system_dir: &Path, target_exe: &Path, shortcut_path: &Path) -> Result<(), String> {
     let tgt = target_exe.display().to_string().replace('\'', "''");
     let lnk = shortcut_path.display().to_string().replace('\'', "''");
     let script = format!(
         "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('{lnk}'); $s.TargetPath = '{tgt}'; $s.Arguments = '{OPEN_PAIR_ARG}'; $s.Description = 'Desk Pager — Posture, Eye Rest & Hydration Reminders'; $s.IconLocation = '{tgt},0'; $s.Save()"
     );
-    let _ = Command::new("powershell")
+    let status = Command::new(system_dir.join(POWERSHELL_EXE))
         .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
+        .status()
+        .map_err(|e| format!("cannot run powershell: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("powershell ended with {status}"))
+    }
 }
 
-/// Uninstalls Desk Pager when invoked from Windows Settings -> Installed Apps (`--uninstall`).
-fn uninstall_desk_pager() {
-    let my_pid = std::process::id();
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "desk-pager.exe", "/FI", &format!("PID ne {my_pid}")])
+/// Maps a "not found" I/O error to success, for removing things that may already be gone.
+fn ignore_missing(result: std::io::Result<()>) -> Result<(), String> {
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Removes a registry tree under HKCU; a key that is already absent counts as success.
+fn remove_reg_tree(path: &str) -> Result<(), String> {
+    match windows_registry::CURRENT_USER.remove_tree(path) {
+        Err(e) if windows_registry::CURRENT_USER.open(path).is_ok() => Err(e.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Returns `dir` as text when it is exactly the canonical install directory and safe to quote for `cmd.exe`.
+///
+/// * `dir` - Directory about to be removed.
+/// * `local_app_data` - Value of `%LOCALAPPDATA%`.
+fn checked_install_dir(dir: &Path, local_app_data: &Path) -> Result<String, String> {
+    if !local_app_data.is_absolute() || local_app_data.components().any(|c| c == Component::ParentDir) {
+        return Err("LOCALAPPDATA is not a plain absolute path".to_string());
+    }
+    if dir != local_app_data.join("Programs").join(APP_DIR) {
+        return Err("not the Desk Pager install directory".to_string());
+    }
+    let text = dir.to_str().ok_or("install directory is not valid Unicode")?;
+    // cmd.exe still expands %VAR% inside double quotes, and a quote would end the quoting.
+    if text.contains(['"', '%']) {
+        return Err("install directory contains a character cmd.exe would reinterpret".to_string());
+    }
+    Ok(text.to_string())
+}
+
+/// Builds the raw `cmd.exe` arguments that wait about a second (so this exe can exit) and then remove `dir`.
+///
+/// * `ping` - Absolute path of `ping.exe`, used as the delay.
+/// * `dir` - Directory to remove; must not contain `"` or `%`.
+fn rmdir_command_line(ping: &Path, dir: &str) -> String {
+    // cmd strips the outermost quote pair after /C, leaving each inner path correctly quoted.
+    format!("/C \"\"{}\" 127.0.0.1 -n 2 > nul & rmdir /S /Q \"{dir}\"\"", ping.display())
+}
+
+/// Starts a detached `cmd.exe` that removes the install folder once this process has exited.
+fn schedule_install_dir_removal(system_dir: &Path) -> Result<(), String> {
+    let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA not set")?);
+    let exe = canonical_install_exe().ok_or("LOCALAPPDATA not set")?;
+    let dir = checked_install_dir(exe.parent().ok_or("invalid install directory")?, &local_app_data)?;
+    Command::new(system_dir.join(CMD_EXE))
+        .raw_arg(rmdir_command_line(&system_dir.join(PING_EXE), &dir))
+        // Start outside the install folder: a process whose working directory is inside it blocks rmdir.
+        .current_dir(system_dir)
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    let _ = set_autostart(false);
-    let _ = windows_registry::CURRENT_USER.remove_tree(UNINSTALL_KEY);
-    let _ = windows_registry::CURRENT_USER.remove_tree(AUMID_KEY);
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let _ = std::fs::remove_file(
-            PathBuf::from(appdata)
-                .join("Microsoft")
-                .join("Windows")
-                .join("Start Menu")
-                .join("Programs")
-                .join("Desk Pager.lnk"),
-        );
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("cannot run cmd: {e}"))
+}
+
+/// Removes `%LOCALAPPDATA%\DeskPager` (log and settings).
+fn remove_data_dir() -> Result<(), String> {
+    let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA not set")?);
+    if !local_app_data.is_absolute() {
+        return Err("LOCALAPPDATA is not an absolute path".to_string());
     }
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        let _ = std::fs::remove_file(PathBuf::from(profile).join("Desktop").join("Desk Pager.lnk"));
+    ignore_missing(std::fs::remove_dir_all(local_app_data.join(APP_DIR)))
+}
+
+/// Uninstalls Desk Pager when invoked from Windows Settings -> Installed Apps (`--uninstall`): stops the running
+/// copy, then removes autostart, registry entries, shortcuts, the pairing secret, the install folder and app data.
+fn uninstall_desk_pager() {
+    let mut failed = Vec::new();
+    let system_dir = system_dir();
+    record_step(&mut failed, "stop running copy", system_dir.clone().and_then(|dir| kill_other_instances(&dir)));
+    record_step(&mut failed, "start with Windows entry", set_autostart(false));
+    record_step(&mut failed, "uninstall registry entry", remove_reg_tree(UNINSTALL_KEY));
+    record_step(&mut failed, "notification registry entry", remove_reg_tree(AUMID_KEY));
+    for (name, path) in shortcut_paths() {
+        record_step(&mut failed, name, path.and_then(|lnk| ignore_missing(std::fs::remove_file(lnk))));
     }
-    if let Some(exe) = canonical_install_exe() {
-        if let Some(dir) = exe.parent() {
-            let dir_str = dir.display().to_string();
-            let _ = Command::new("cmd")
-                .args(["/C", &format!("ping 127.0.0.1 -n 2 > nul & rmdir /S /Q \"{dir_str}\"")])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
-        }
+    record_step(&mut failed, "pairing secret", secret::delete().map_err(|e| e.to_string()));
+    record_step(&mut failed, "install folder", system_dir.and_then(|dir| schedule_install_dir_removal(&dir)));
+    record_step(&mut failed, "data folder", remove_data_dir());
+    // Written after the data folder is gone, so a failed uninstall still leaves one line saying what is left.
+    if !failed.is_empty() {
+        log(&format!("uninstall finished with failed steps: {}", failed.join(", ")));
     }
 }
 
@@ -1144,8 +1373,11 @@ fn set_autostart(enable: bool) -> Result<(), String> {
         key.set_string(RUN_VALUE, format!("\"{}\" {AUTOSTART_ARG}", exe.display()))
             .map_err(|e| e.to_string())
     } else {
-        let _ = key.remove_value(RUN_VALUE);
-        Ok(())
+        match key.remove_value(RUN_VALUE) {
+            // Removing a value that was never there fails too; only a value still present is a real failure.
+            Err(e) if key.get_string(RUN_VALUE).is_ok() => Err(e.to_string()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1203,7 +1435,7 @@ pub fn log(msg: &str) {
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     );
     let written = std::env::var_os("LOCALAPPDATA").and_then(|dir| {
-        let dir = PathBuf::from(dir).join("DeskPager");
+        let dir = PathBuf::from(dir).join(APP_DIR);
         std::fs::create_dir_all(&dir).ok()?;
         OpenOptions::new().create(true).append(true).open(dir.join(LOG_FILE)).ok()?.write_all(line.as_bytes()).ok()
     });
@@ -1215,47 +1447,160 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
     use std::time::Instant;
 
+    /// Builds a queued message whose body tells otherwise identical messages apart.
+    fn msg(title: &'static str, body: &str) -> Outgoing {
+        Outgoing { title, body: body.to_string() }
+    }
+
     #[test]
-    fn spawned_single_flight_delivery_never_stalls_timer_or_piles_up() {
-        let cfg = core::Config::default();
-        let mut tracker = core::Tracker::default();
-        for now in (0..2700).step_by(5) {
-            assert_eq!(tracker.tick(&cfg, now, 0, false, false), None);
-        }
-        assert_eq!(
-            tracker.tick(&cfg, 2700, 0, false, false),
-            Some(core::Alert { kind: core::AlertKind::QuickStretch, minutes: 45, number: 1 })
-        );
+    fn sender_thread_keeps_order_drops_nothing_under_the_cap_and_never_blocks_the_caller() {
+        let (tx, rx) = mpsc::channel();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let sender = std::thread::spawn(move || {
+            run_sender(rx, |m| {
+                // A slow network send: later messages must wait their turn, not be skipped.
+                std::thread::sleep(Duration::from_millis(30));
+                sink.lock().unwrap().push(m);
+            })
+        });
 
-        let sending = Arc::new(AtomicBool::new(false));
-        let ran = Arc::new(AtomicU32::new(0));
-        let ran1 = Arc::clone(&ran);
+        let queued = [
+            msg("Time for a long break", "1"),
+            msg("Quick stretch & eye rest", "2"),
+            msg(CLEAR_TITLE, "3"),
+            msg("Desk Pager test", "4"),
+            msg(CLEAR_TITLE, "5"),
+        ];
         let t0 = Instant::now();
-        assert!(spawn_single_flight(&sending, move || {
-            ran1.fetch_add(1, Ordering::Relaxed);
-            std::thread::sleep(Duration::from_millis(80));
-        }));
-        // Must return immediately without blocking the timer thread.
-        assert!(t0.elapsed() < Duration::from_millis(40));
-
-        // While the first send is in flight, a second send must be skipped instead of piling up.
-        let ran2 = Arc::clone(&ran);
-        assert!(!spawn_single_flight(&sending, move || {
-            ran2.fetch_add(1, Ordering::Relaxed);
-        }));
-
-        // Timer ticks on schedule 5s later; cumulative long-break session stays intact and reaches 46 min at 2760s.
-        for now in (2705..=2760).step_by(5) {
-            assert_eq!(tracker.tick(&cfg, now, 0, false, false), None);
+        for m in &queued {
+            tx.send(msg(m.title, &m.body)).unwrap();
         }
-        assert_eq!(tracker.long_minutes(2760), 46);
+        assert!(t0.elapsed() < Duration::from_millis(25), "queueing must not wait for a send");
 
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(ran.load(Ordering::Relaxed), 1);
-        assert!(!sending.load(Ordering::Acquire));
+        drop(tx);
+        sender.join().unwrap();
+        assert_eq!(*sent.lock().unwrap(), queued);
+    }
+
+    #[test]
+    fn send_queue_drops_only_the_oldest_buzz_past_the_cap_and_never_a_clear() {
+        let mut q = SendQueue::default();
+        assert_eq!(q.push(msg(CLEAR_TITLE, "clear-0")), None);
+        for i in 1..MAX_PENDING_SENDS {
+            assert_eq!(q.push(msg("buzz", &i.to_string())), None, "nothing dropped up to the cap");
+        }
+        // One past the cap: the oldest buzz goes, the older clear stays.
+        assert_eq!(q.push(msg("buzz", "new")), Some(msg("buzz", "1")));
+        assert_eq!(q.pending.len(), MAX_PENDING_SENDS);
+        assert_eq!(q.pop(), Some(msg(CLEAR_TITLE, "clear-0")));
+        assert_eq!(q.pop(), Some(msg("buzz", "2")));
+        assert_eq!(q.pending.back(), Some(&msg("buzz", "new")));
+
+        // A queue of nothing but clears grows instead of losing one.
+        let mut q = SendQueue::default();
+        for i in 0..=MAX_PENDING_SENDS {
+            assert_eq!(q.push(msg(CLEAR_TITLE, &i.to_string())), None);
+        }
+        assert_eq!(q.pending.len(), MAX_PENDING_SENDS + 1);
+    }
+
+    #[test]
+    fn install_action_covers_every_branch() {
+        use InstallAction::*;
+        // Explicit --install always forces a full first install.
+        assert_eq!(install_action(true, true, true, true), FirstInstall);
+        assert_eq!(install_action(false, false, true, false), FirstInstall);
+        // A Cargo build tree never auto-installs.
+        assert_eq!(install_action(false, false, false, true), RunInPlace);
+        assert_eq!(install_action(true, false, false, true), RunInPlace);
+        // Nothing installed yet.
+        assert_eq!(install_action(false, false, false, false), FirstInstall);
+        // Same binary already installed: no reinstall.
+        assert_eq!(install_action(true, true, false, false), ShowInstalled);
+        // A different binary is installed.
+        assert_eq!(install_action(true, false, false, false), Upgrade);
+    }
+
+    #[test]
+    fn files_identical_compares_length_then_contents() {
+        let dir = std::env::temp_dir().join(format!("deskpager-test-identical-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"same bytes").unwrap();
+        std::fs::write(&b, b"same bytes").unwrap();
+        assert!(files_identical(&a, &b).unwrap());
+        std::fs::write(&b, b"same bytez").unwrap();
+        assert!(!files_identical(&a, &b).unwrap(), "same length, different contents");
+        std::fs::write(&b, b"longer than a").unwrap();
+        assert!(!files_identical(&a, &b).unwrap());
+        assert!(files_identical(&a, &dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_dir_needs_an_absolute_system_root() {
+        assert_eq!(
+            system_dir_from(Some(OsStr::new(r"C:\Windows"))).map(|d| d.join(POWERSHELL_EXE)),
+            Ok(PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"))
+        );
+        assert!(system_dir_from(None).is_err());
+        assert!(system_dir_from(Some(OsStr::new("Windows"))).is_err());
+        assert!(system_dir_from(Some(OsStr::new(""))).is_err());
+    }
+
+    #[test]
+    fn only_the_canonical_install_dir_may_be_removed() {
+        let base = Path::new(r"C:\Users\A B\AppData\Local");
+        assert_eq!(
+            checked_install_dir(&base.join("Programs").join("DeskPager"), base),
+            Ok(r"C:\Users\A B\AppData\Local\Programs\DeskPager".to_string())
+        );
+        assert!(checked_install_dir(&base.join("Programs"), base).is_err());
+        assert!(checked_install_dir(base, base).is_err());
+        assert!(checked_install_dir(Path::new(r"C:\Windows"), base).is_err());
+        // An empty or relative LOCALAPPDATA would make rmdir act relative to the working directory.
+        let relative = Path::new("");
+        assert!(checked_install_dir(&relative.join("Programs").join("DeskPager"), relative).is_err());
+        let dotted = Path::new(r"C:\Users\x\..\y");
+        assert!(checked_install_dir(&dotted.join("Programs").join("DeskPager"), dotted).is_err());
+        let expanding = Path::new(r"C:\Users\%USERNAME%");
+        assert!(checked_install_dir(&expanding.join("Programs").join("DeskPager"), expanding).is_err());
+    }
+
+    #[test]
+    fn rmdir_command_line_uses_cmd_quoting() {
+        assert_eq!(
+            rmdir_command_line(Path::new(r"C:\Windows\System32\ping.exe"), r"C:\Users\A B\Programs\DeskPager"),
+            r#"/C ""C:\Windows\System32\ping.exe" 127.0.0.1 -n 2 > nul & rmdir /S /Q "C:\Users\A B\Programs\DeskPager"""#
+        );
+    }
+
+    #[test]
+    fn rmdir_command_line_really_removes_a_folder_with_spaces() {
+        let dir = std::env::temp_dir().join(format!("deskpager test rmdir {}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("file.txt"), b"x").unwrap();
+        let system_dir = system_dir().unwrap();
+        let status = Command::new(system_dir.join(CMD_EXE))
+            .raw_arg(rmdir_command_line(&system_dir.join(PING_EXE), dir.to_str().unwrap()))
+            .current_dir(&system_dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!dir.exists(), "cmd must have understood the quoting and removed the folder");
+    }
+
+    #[test]
+    fn capture_errors_are_logged_only_on_a_state_change() {
+        assert_eq!(capture_transition(false, None), None);
+        assert!(capture_transition(false, Some("E_FAIL")).is_some_and(|line| line.ends_with("E_FAIL")));
+        assert_eq!(capture_transition(true, Some("E_FAIL")), None, "no repeat every tick");
+        assert_eq!(capture_transition(true, None), Some("call detection recovered".to_string()));
     }
 
     #[test]

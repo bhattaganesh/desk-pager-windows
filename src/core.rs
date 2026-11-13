@@ -207,7 +207,9 @@ impl Tracker {
 
         self.locked_since = if locked { self.locked_since.or(Some(now)) } else { None };
         let lock_break = self.locked_since.is_some_and(|since| now.saturating_sub(since) >= cfg.lock_break);
-        if lock_break || idle_secs >= cfg.idle_away {
+        // A call can leave keyboard and mouse untouched, but a stuck-open mic must not block the away reset forever.
+        let away_after = if in_call { cfg.idle_away.max(cfg.hold_max) } else { cfg.idle_away };
+        if lock_break || idle_secs >= away_after {
             let locked_since = self.locked_since;
             self.reset();
             self.last_tick = Some(now);
@@ -454,6 +456,32 @@ mod tests {
             assert_eq!(t.tick(&cfg, now, idle, false, false), None);
         }
         assert_eq!(sit(&mut t, &cfg, 2295, 2700), vec![(2700, 1)]);
+    }
+
+    #[test]
+    fn idle_during_a_call_is_not_away_until_hold_max() {
+        let (cfg, mut t) = (Config::default(), Tracker::default());
+        sit(&mut t, &cfg, 0, 1000);
+        // 20 minutes on a call without touching keyboard or mouse keeps the session.
+        for (now, idle) in (1005..=2200).step_by(5).zip((5..).step_by(5)) {
+            assert_eq!(t.tick(&cfg, now, idle, false, true), None);
+        }
+        assert_eq!(t.minutes(2200), 36, "idle during a call must not reset");
+        assert_eq!(t.long_minutes(2200), 36);
+
+        // A mic left open cannot suppress the away reset past hold_max of idle.
+        for (now, idle) in (2205..3700).step_by(5).zip((1205..).step_by(5)) {
+            assert_eq!(t.tick(&cfg, now, idle, false, true), None);
+        }
+        assert_eq!(t.long_minutes(3695), 61, "still held just below hold_max of idle");
+        assert_eq!(t.tick(&cfg, 3700, cfg.hold_max, false, true), None);
+        assert_eq!(t.long_minutes(3700), 0, "idle >= hold_max during a call resets");
+
+        // Without a call the normal idle_away threshold still applies.
+        let mut t = Tracker::default();
+        sit(&mut t, &cfg, 0, 1000);
+        assert_eq!(t.tick(&cfg, 1005, cfg.idle_away, false, false), None);
+        assert_eq!(t.long_minutes(1005), 0, "idle >= idle_away with no call resets");
     }
 
     #[test]

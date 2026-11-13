@@ -7,7 +7,7 @@ use windows::{
     Win32::{
         Foundation::ERROR_NOT_FOUND,
         Security::Credentials::{
-            CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+            CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
         },
     },
 };
@@ -39,6 +39,15 @@ pub fn regenerate() -> Result<String> {
     let value = format!("{TOPIC_PREFIX}{hex}");
     write(&value)?;
     Ok(value)
+}
+
+/// Deletes the stored topic from Windows Credential Manager; an already-missing entry counts as success.
+pub fn delete() -> Result<()> {
+    // SAFETY: `TARGET` is a static NUL-terminated wide string.
+    match unsafe { CredDeleteW(TARGET, CRED_TYPE_GENERIC, None) } {
+        Err(e) if e.code() != ERROR_NOT_FOUND.to_hresult() => Err(e),
+        _ => Ok(()),
+    }
 }
 
 fn read() -> Result<Option<String>> {
