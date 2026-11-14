@@ -9,6 +9,10 @@ const SHOW_SECONDS_BELOW = 120;
 const AWAY_HINT_SECS = 10;
 // The label the backend reports as the "call app" while Meeting mode holds reminders.
 const MEETING_LABEL = "Meeting mode";
+// Gap between clearing and rewriting an action message, so a repeated message is seen and announced again.
+const REANNOUNCE_MS = 80;
+// Keeps a number and its unit on one line.
+const NBSP = "\u00a0";
 
 const byId = (id) => document.getElementById(id);
 
@@ -38,6 +42,8 @@ const notifySwitch = byId("toggle-notify");
 const qrEl = byId("qr");
 const codeInput = byId("code");
 const toggleCodeBtn = byId("toggle-code");
+const codeDisclosure = byId("code-disclosure");
+const qrColumn = byId("qr-col");
 const pairFeedback = byId("pair-feedback");
 const testFeedback = byId("test-feedback");
 const regenBtn = byId("regenerate");
@@ -62,6 +68,8 @@ let invoke = null;
 let pollTimer = null;
 let savedSettings = null;
 let savesInFlight = 0;
+let saveChain = Promise.resolve();
+const pendingSay = new WeakMap();
 
 // ---------- small DOM helpers: write only when the value changed, so the 2 s poll causes no needless layout ----------
 
@@ -93,19 +101,23 @@ function errorText(err) {
 }
 
 // Shows the result of an action; errors are worded as errors, not marked by colour alone.
+// The text is cleared first so that repeating an action shows, and announces, its result again.
 function say(el, message, isError = false) {
   el.classList.toggle("is-error", isError);
-  setText(el, isError ? `Error: ${message}` : message);
+  el.textContent = "";
+  clearTimeout(pendingSay.get(el));
+  const text = isError ? `Error: ${message}` : message;
+  pendingSay.set(el, setTimeout(() => (el.textContent = text), REANNOUNCE_MS));
 }
 
 // "45 s" under two minutes, otherwise "12 min" or "1 h 20 min". `round` is Math.ceil for time left, Math.floor for time spent.
 function formatDuration(secs, round = Math.floor) {
-  if (secs < SHOW_SECONDS_BELOW) return `${secs} s`;
+  if (secs < SHOW_SECONDS_BELOW) return `${secs}${NBSP}s`;
   const mins = round(secs / SECS_PER_MIN);
-  if (mins < MINS_PER_HOUR) return `${mins} min`;
+  if (mins < MINS_PER_HOUR) return `${mins}${NBSP}min`;
   const rest = mins % MINS_PER_HOUR;
-  const hours = `${Math.floor(mins / MINS_PER_HOUR)} h`;
-  return rest === 0 ? hours : `${hours} ${rest} min`;
+  const hours = `${Math.floor(mins / MINS_PER_HOUR)}${NBSP}h`;
+  return rest === 0 ? hours : `${hours} ${rest}${NBSP}min`;
 }
 
 // Runs one command for a control: busy state while it runs, its result or its error shown in `feedbackEl`.
@@ -133,7 +145,12 @@ function selectTab(index, moveFocus = false) {
     tab.tabIndex = selected ? 0 : -1;
     panel.hidden = !selected;
   });
+  if (index !== PHONE_TAB) hidePairingSecret();
   if (moveFocus) TABS[index].tab.focus();
+}
+
+function focusSelectedTab() {
+  TABS.find(({ tab }) => tab.getAttribute("aria-selected") === "true").tab.focus();
 }
 
 function onTabKeydown(event) {
@@ -162,14 +179,15 @@ function setState(kind, label, reason) {
 function renderState(s) {
   if (s.paused) {
     setState("paused", "Paused", "No reminders are sent and both timers stay at zero until you turn Pause off.");
-  } else if (s.call_app === MEETING_LABEL) {
-    setState("hold", "On hold: Meeting mode is on", "Sitting time still counts. Reminders wait while Meeting mode is on.");
-  } else if (s.call_app) {
+  } else if (s.call_app && s.call_app !== MEETING_LABEL) {
     setState(
       "hold",
       "On hold during a call",
       `${s.call_app} is using the microphone. Sitting time still counts; reminders wait until shortly after the call ends.`
     );
+  } else if (s.in_meeting) {
+    // `in_meeting` changes with the switch at once; the backend's hold label only follows on its next tick.
+    setState("hold", "On hold: Meeting mode is on", "Sitting time still counts. Reminders wait while Meeting mode is on.");
   } else {
     setState("tracking", "Tracking your sitting time", "");
   }
@@ -207,15 +225,18 @@ function renderLongTimer(s, held) {
     headline = "Paused";
   } else if (sat < target) {
     headline = `Long break in ${formatDuration(target - sat, Math.ceil)}`;
+  } else if (held) {
+    headline = "Long break due, on hold";
   } else if (s.idle_secs >= AWAY_HINT_SECS) {
-    headline = `On your break: away ${formatDuration(s.idle_secs)} of ${s.long_break_mins} min`;
+    const walkSecs = s.long_break_mins * SECS_PER_MIN;
+    headline = `On your break: away ${formatDuration(Math.min(s.idle_secs, walkSecs))} of ${s.long_break_mins}${NBSP}min`;
   } else {
-    headline = held ? "Long break due, on hold" : `Long break due now: walk for ${s.long_break_mins} min`;
+    headline = `Long break due now: walk for ${s.long_break_mins}${NBSP}min`;
   }
   setText(longHeadline, headline);
   const progressText = `${formatDuration(sat)} of ${formatDuration(target)}`;
   setProgress(longProgress, sat, target, progressText);
-  setText(longDetail, `Sitting for ${progressText} · then a ${s.long_break_mins} min walk`);
+  setText(longDetail, `Sitting for ${progressText} · then a ${s.long_break_mins}${NBSP}min walk`);
 }
 
 function renderStatus(s) {
@@ -226,9 +247,8 @@ function renderStatus(s) {
   setSwitch(autostartSwitch, s.autostart);
   setSwitch(notifySwitch, s.desktop_notify);
   renderState(s);
-  const held = Boolean(s.call_app);
-  renderShortTimer(s, held);
-  renderLongTimer(s, held);
+  renderShortTimer(s, s.buzz_held);
+  renderLongTimer(s, s.buzz_held);
 }
 
 async function refreshStatus() {
@@ -257,7 +277,7 @@ function stopPolling() {
 function describeSchedule(s) {
   const every = formatDuration(s.short_every_mins * SECS_PER_MIN);
   const after = formatDuration(s.long_every_mins * SECS_PER_MIN);
-  return `Quick stretch every ${every} for ${s.short_break_secs} s. Long break after ${after} of sitting, with a ${s.long_break_mins} min walk.`;
+  return `Quick stretch every ${every} for ${s.short_break_secs}${NBSP}s. Long break after ${after} of sitting, with a ${s.long_break_mins}${NBSP}min walk.`;
 }
 
 // Returns why a field's text cannot be saved, or "" when it is a whole number inside its range.
@@ -299,9 +319,17 @@ function applySettings(settings) {
   setText(scheduleSummary, describeSchedule(settings));
 }
 
-// Saves the schedule after `changed` was committed. Other fields holding invalid text keep their saved value.
-async function saveSchedule(changed) {
-  if (!savedSettings) throw new Error("the schedule has not loaded yet");
+function restoreSavedValues() {
+  for (const field of FIELDS) {
+    field.input.value = savedSettings[field.key];
+    setFieldMessage(field, "", false);
+  }
+  syncPresetChips();
+}
+
+// Validates the form after `changed` was committed. Returns what to save, or null when `changed` itself is invalid.
+// Other fields holding invalid text keep their saved value.
+function buildSaveRequest(changed) {
   const args = {};
   const typed = new Map();
   for (const field of FIELDS) {
@@ -314,27 +342,56 @@ async function saveSchedule(changed) {
       typed.set(field, args[field.arg]);
     }
   }
-  if (!typed.has(changed)) {
-    say(scheduleFeedback, "Not saved. Fix the marked field first.", true);
-    return;
-  }
-  savesInFlight += 1;
+  return typed.has(changed) ? { args, typed } : null;
+}
+
+async function sendSave({ args, typed }) {
   try {
     const saved = await invoke("save_settings", args);
-    applySettings(saved);
-    for (const [field, value] of typed) {
-      // The backend keeps a long break from coming sooner than a quick stretch; say so instead of changing it silently.
-      if (saved[field.key] !== value) setFieldMessage(field, `Adjusted to ${saved[field.key]} to fit the allowed range.`, false);
+    savedSettings = saved;
+    setText(scheduleSummary, describeSchedule(saved));
+    // With a newer save already queued, its values (still in the form) must not be overwritten by this result.
+    if (savesInFlight === 1) {
+      applySettings(saved);
+      for (const [field, value] of typed) {
+        // The backend keeps a long break from coming sooner than a quick stretch; say so instead of changing it silently.
+        if (saved[field.key] !== value) setFieldMessage(field, `Adjusted to ${saved[field.key]} to fit the allowed range.`, false);
+      }
     }
     say(scheduleFeedback, "Saved. The new schedule is in force.");
+  } catch (err) {
+    if (savesInFlight === 1) restoreSavedValues();
+    say(scheduleFeedback, `Not saved: ${errorText(err)}. The fields show the schedule still in force.`, true);
   } finally {
     savesInFlight -= 1;
   }
   await refreshStatus();
 }
 
+// Saves after `field` was committed. Saves run one at a time, in the order they were committed.
 function commitField(field) {
-  saveSchedule(field).catch((err) => say(scheduleFeedback, `Not saved: ${errorText(err)}`, true));
+  if (!savedSettings) return say(scheduleFeedback, "the schedule has not loaded yet", true);
+  const request = buildSaveRequest(field);
+  if (!request) return say(scheduleFeedback, "Not saved. Fix the marked field first.", true);
+  savesInFlight += 1;
+  saveChain = saveChain.then(() => sendSave(request));
+}
+
+// The next value for a stepper: the nearest multiple of the step in that direction (1 -> 5 -> 10), inside the range.
+function steppedValue(base, delta, min, max) {
+  const step = Math.abs(delta);
+  const next = delta > 0 ? Math.floor(base / step) * step + step : Math.ceil(base / step) * step - step;
+  return Math.min(max, Math.max(min, next));
+}
+
+// Puts `value` in a field; saves it unless it is what is saved already.
+function setFieldValue(field, value) {
+  const unchanged = savedSettings && value === savedSettings[field.key] && savesInFlight === 0;
+  if (unchanged && !fieldProblem(field) && Number(field.input.value) === value) return;
+  field.input.value = value;
+  syncPresetChips();
+  if (unchanged) setFieldMessage(field, "", false);
+  else commitField(field);
 }
 
 function wireSchedule() {
@@ -357,20 +414,14 @@ function wireSchedule() {
       if (!savedSettings) return say(scheduleFeedback, "the schedule has not loaded yet", true);
       const base = fieldProblem(field) ? savedSettings[field.key] : Number(field.input.value);
       const { min, max } = field.input;
-      field.input.value = Math.min(Number(max), Math.max(Number(min), base + Number(stepBtn.dataset.delta)));
-      syncPresetChips();
-      commitField(field);
+      setFieldValue(field, steppedValue(base, Number(stepBtn.dataset.delta), Number(min), Number(max)));
     });
   }
 
   for (const group of document.querySelectorAll(".chips")) {
     const field = FIELDS.find((f) => f.id === group.dataset.for);
     for (const chip of group.querySelectorAll(".chip")) {
-      chip.addEventListener("click", () => {
-        field.input.value = chip.dataset.val;
-        syncPresetChips();
-        commitField(field);
-      });
+      chip.addEventListener("click", () => setFieldValue(field, Number(chip.dataset.val)));
     }
   }
 }
@@ -394,7 +445,12 @@ function wireSwitch(control, feedbackEl, change, describe) {
 function setCodeVisible(visible) {
   codeInput.type = visible ? "text" : "password";
   toggleCodeBtn.textContent = visible ? "Hide" : "Show";
-  toggleCodeBtn.setAttribute("aria-pressed", String(visible));
+}
+
+// Puts the typed code back behind dots and closes its disclosure, e.g. when the Phone tab is left.
+function hidePairingSecret() {
+  setCodeVisible(false);
+  codeDisclosure.open = false;
 }
 
 function showPairing(info) {
@@ -402,6 +458,29 @@ function showPairing(info) {
   qrEl.innerHTML = info.qr_svg;
   codeInput.value = info.code;
   setCodeVisible(false);
+  qrColumn.hidden = false;
+  codeDisclosure.hidden = false;
+}
+
+// Removes a QR code and code that can no longer be trusted, rather than leaving a dead one on screen.
+function clearPairing() {
+  qrEl.replaceChildren();
+  codeInput.value = "";
+  hidePairingSecret();
+  qrColumn.hidden = true;
+  codeDisclosure.hidden = true;
+}
+
+// Loads the pairing code that is in force. Returns the pairing info, or throws after clearing the display.
+async function loadPairing() {
+  try {
+    const info = await invoke("pairing_info");
+    showPairing(info);
+    return info;
+  } catch (err) {
+    clearPairing();
+    throw new Error(`the pairing code cannot be shown (${errorText(err)}). Quit Desk Pager from the tray icon and start it again.`);
+  }
 }
 
 function closeRegenConfirm() {
@@ -442,8 +521,14 @@ function wirePhone() {
   const confirmBtn = byId("regen-confirm-btn");
   confirmBtn.addEventListener("click", () =>
     runAction(confirmBtn, regenFeedback, async () => {
-      showPairing(await invoke("regenerate_pairing"));
       closeRegenConfirm();
+      try {
+        showPairing(await invoke("regenerate_pairing"));
+      } catch (err) {
+        // The old QR code may be dead now: show whatever code is really in force, or nothing.
+        await loadPairing();
+        throw new Error(`${errorText(err)}. The QR code above is the one in force now; pair your phone with it again.`);
+      }
       return "New code ready. Pair your phone again by scanning the new QR code.";
     })
   );
@@ -455,9 +540,11 @@ function wireToday() {
   const stretchBtn = byId("mark-stretch");
   stretchBtn.addEventListener("click", () =>
     runAction(stretchBtn, todayFeedback, async () => {
-      await invoke("mark_quick_stretch");
+      const reset = await invoke("mark_quick_stretch");
       await refreshStatus();
-      return "Quick-stretch timer restarted. The long-break timer keeps counting.";
+      return reset === "both"
+        ? "Both timers restarted from zero, because you had been sitting for less than one quick-stretch interval."
+        : "Quick-stretch timer restarted. The long-break timer keeps counting.";
     })
   );
 
@@ -518,6 +605,7 @@ async function init() {
     runAction(dismissBtn, todayFeedback, async () => {
       await invoke("dismiss_install_banner");
       installBanner.hidden = true;
+      focusSelectedTab();
     })
   );
   wireToday();
@@ -525,16 +613,22 @@ async function init() {
   wireSettings();
   wirePhone();
 
-  document.addEventListener("visibilitychange", () => (document.hidden ? stopPolling() : startPolling()));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+      hidePairingSecret();
+    } else {
+      startPolling();
+    }
+  });
   startPolling();
 
   try {
-    const info = await invoke("pairing_info");
-    showPairing(info);
+    const info = await loadPairing();
     if (info.first_run) selectTab(PHONE_TAB);
   } catch (err) {
-    say(pairFeedback, `could not load the pairing code: ${errorText(err)}`, true);
-    showAppError(`Could not load the pairing code: ${errorText(err)}`);
+    say(pairFeedback, errorText(err), true);
+    showAppError(errorText(err));
   }
 
   try {
@@ -543,7 +637,10 @@ async function init() {
     say(scheduleFeedback, `could not load the schedule: ${errorText(err)}`, true);
   }
 
-  await invoke("pairing_rendered", { qrShown: qrEl.querySelector("svg") !== null });
+  // Diagnostics only (a log line in the app): its failure must not look like a broken window.
+  invoke("pairing_rendered", { qrShown: qrEl.querySelector("svg") !== null }).catch((err) =>
+    console.warn("pairing_rendered failed:", errorText(err))
+  );
 }
 
 init().catch((err) => showAppError(`Desk Pager's window did not start properly: ${errorText(err)}`));

@@ -1,4 +1,4 @@
-# Desk Pager for Windows (`v0.6.0`)
+# Desk Pager for Windows (`v0.6.1`)
 
 A lightweight Windows system-tray application that tracks continuous sitting with context awareness (input idle, workstation lock/sleep, and active microphone calls) and delivers two-tier posture, eye-rest, and walk reminders to your Android phone via [ntfy.sh](https://ntfy.sh) (free, no account) plus an optional silent Windows 11 Notification Center alert.
 
@@ -7,10 +7,10 @@ A lightweight Windows system-tray application that tracks continuous sitting wit
 To use Desk Pager, you need **both** the Windows desktop application on your laptop(s) and the companion Android application on your phone. Multiple releases are available — always download the **latest version** from the links below:
 
 1. **Windows Desktop Application (`desk-pager.exe`):**
-   - **Latest Release (`v0.6.0`):** [https://github.com/bhattaganesh/desk-pager-windows/releases/latest](https://github.com/bhattaganesh/desk-pager-windows/releases/latest)
+   - **Latest Release (`v0.6.1`):** [https://github.com/bhattaganesh/desk-pager-windows/releases/latest](https://github.com/bhattaganesh/desk-pager-windows/releases/latest)
    - **All Windows Releases:** [https://github.com/bhattaganesh/desk-pager-windows/releases](https://github.com/bhattaganesh/desk-pager-windows/releases)
 2. **Companion Android Mobile Application (`desk-pager.apk` — Required on your phone):**
-   - **Latest Release (`v0.4.0`):** [https://github.com/bhattaganesh/desk-pager-android/releases/latest](https://github.com/bhattaganesh/desk-pager-android/releases/latest)
+   - **Latest Release (`v0.5.0`):** [https://github.com/bhattaganesh/desk-pager-android/releases/latest](https://github.com/bhattaganesh/desk-pager-android/releases/latest)
    - **All Android Releases:** [https://github.com/bhattaganesh/desk-pager-android/releases](https://github.com/bhattaganesh/desk-pager-android/releases)
 
 ---

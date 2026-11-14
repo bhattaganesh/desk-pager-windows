@@ -126,6 +126,7 @@ pub struct Tracker {
     stretches_completed: u32,
     last_call: Option<u64>,
     held_since: Option<u64>,
+    holding: bool,
 }
 
 impl Tracker {
@@ -141,6 +142,11 @@ impl Tracker {
         self.alerts_sent = 0;
         self.held_since = None;
         self.stretches_completed = self.stretches_completed.saturating_add(1);
+    }
+
+    /// Whether the last `tick` kept back a due buzz because of a call or its grace period.
+    pub fn is_holding(&self) -> bool {
+        self.holding
     }
 
     /// Number of quick stretches completed within the current long-break session.
@@ -200,6 +206,7 @@ impl Tracker {
     pub fn tick(&mut self, cfg: &Config, now: u64, idle_secs: u64, locked: bool, in_call: bool) -> Option<Alert> {
         let slept = self.last_tick.is_some_and(|last| now.saturating_sub(last) > cfg.suspend_gap);
         self.last_tick = Some(now);
+        self.holding = false;
         if slept {
             self.reset();
             self.last_tick = Some(now);
@@ -272,6 +279,7 @@ impl Tracker {
         if in_call || in_grace {
             let held_since = *self.held_since.get_or_insert(now);
             if now.saturating_sub(held_since) < cfg.hold_max {
+                self.holding = true;
                 return None;
             }
         } else {
@@ -535,6 +543,39 @@ mod tests {
             t.tick(&cfg, 2830, 0, false, false),
             Some(Alert { kind: AlertKind::QuickStretch, minutes: 47, number: 1 })
         );
+    }
+
+    #[test]
+    fn is_holding_matches_the_hold_decision() {
+        let cfg = Config { short_break_secs: 0, ..Config::default() };
+        let mut t = Tracker::default();
+        sit(&mut t, &cfg, 0, 2600);
+        // On a call but nothing is due yet: nothing is being held.
+        t.tick(&cfg, 2605, 0, false, true);
+        assert!(!t.is_holding());
+        // Due during the call, and during the grace period after it.
+        for now in (2610..=2800).step_by(5) {
+            t.tick(&cfg, now, 0, false, true);
+        }
+        assert!(t.is_holding());
+        t.tick(&cfg, 2805, 0, false, false);
+        assert!(t.is_holding(), "still held during call_grace");
+        // Grace over: the buzz fires and nothing is held any more.
+        for now in (2810..=2825).step_by(5) {
+            t.tick(&cfg, now, 0, false, false);
+        }
+        assert!(t.tick(&cfg, 2830, 0, false, false).is_some());
+        assert!(!t.is_holding());
+
+        // A call longer than hold_max stops holding once the cap is reached.
+        let mut t = Tracker::default();
+        sit(&mut t, &cfg, 0, 2695);
+        for now in (2700..=5395).step_by(5) {
+            t.tick(&cfg, now, 0, false, true);
+        }
+        assert!(t.is_holding());
+        assert!(t.tick(&cfg, 5400, 0, false, true).is_some());
+        assert!(!t.is_holding(), "hold_max reached: no longer held");
     }
 
     #[test]
